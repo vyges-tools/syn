@@ -1,0 +1,24 @@
+[package]
+name = "vyges-syn"
+version = "0.1.45"
+edition = "2021"
+description = "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/syn"
+build = "build.rs"
+
+[dependencies]
+serde_json = "1"
+# The causal trail. ⚠️ `default-features = false` as in the other engines: the trail is
+# structured output on stderr, not a logging framework this engine gets to choose.
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
+
+[[bin]]
+name = "vyges-syn"
+path = "src/main.rs"
+
+[lib]
+name = "vyges_syn"
+path = "src/lib.rs"
