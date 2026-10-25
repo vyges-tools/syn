@@ -7,6 +7,7 @@ pub mod graph;
 pub mod instance;
 pub mod net;
 pub mod parse;
+pub mod stats;
 
 pub use graph::{Equivalence, Graph, InstId};
 pub use instance::{BinOp, Instance, Kind, ShiftOp};

@@ -3,7 +3,12 @@
 
 pub mod abc;
 pub mod bitblast;
+pub mod combinational_mapper;
 pub mod constant_fold;
+pub mod export;
 pub mod import;
 pub mod liveness;
+pub mod npn;
+pub mod opt_gatefusion;
 pub mod sequential_mapper;
+pub mod target_index;

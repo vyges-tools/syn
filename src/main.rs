@@ -32,11 +32,16 @@ USAGE:
                                   read a netlist in the IR text form (its library cells imported),
                                   run the passes in order, write it back. PASS: normalize, opt,
                                   bitblast, bitblast-no-arith, liveness, abc-fraig, abc-dc2
-                                  (the ABC round trips of synthesize), map-sequentials
+                                  (the ABC round trips of synthesize), map-sequentials,
+                                  map-combinationals, gate-fuse, stats (printed)
   vyges physical syn ir-pass [--liberty LIB]... -o OUT.ir PASS... --sv <slang arguments...>
                                   the same on the design as sv-elaborate leaves it, in memory
                                   (what the text form does not carry, register reset and clear
                                   values, kept)
+  vyges physical syn synthesize [--liberty LIB]... [--lef LEF]... -o OUT.v <slang arguments...>
+                                  elaborate SystemVerilog, synthesize it onto the libraries' cells
+                                  and write the mapped netlist as structural Verilog; the LEFs (the
+                                  technology first) give the cells' masters
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -58,7 +63,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass", "synthesize"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -152,7 +157,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
                 }
                 i += 1;
             }
-            a if matches!(a, "normalize" | "opt" | "bitblast" | "bitblast-no-arith" | "liveness" | "abc-fraig" | "abc-dc2" | "map-sequentials") => {
+            a if matches!(a, "normalize" | "opt" | "bitblast" | "bitblast-no-arith" | "liveness" | "abc-fraig" | "abc-dc2" | "map-sequentials" | "map-combinationals" | "gate-fuse" | "stats") => {
                 passes.push(a.to_string())
             }
             a if input.is_none() && !a.starts_with('-') => input = Some(a.to_string()),
@@ -235,6 +240,14 @@ fn ir_pass(args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            "map-combinationals" => {
+                if let Err(e) = vyges_syn::flow::combinational_mapper::map_combinationals(&mut g, &libs) {
+                    println!("[ERROR SYN-{:04}] {}", e.code, e.message);
+                    return ExitCode::from(1);
+                }
+            }
+            "stats" => print!("{}", g.stats()),
+            "gate-fuse" => vyges_syn::flow::opt_gatefusion::gate_fusion_opt(&mut g, &libs),
             "liveness" => {
                 let (regs, combs) = vyges_syn::flow::liveness::liveness_opt(&mut g, false);
                 println!("[INFO SYN-0056] liveness: replaced {regs} register bits, {combs} combinational bits");
@@ -243,6 +256,85 @@ fn ir_pass(args: &[String]) -> ExitCode {
         }
     }
     if let Err(e) = std::fs::write(&out, g.dump()) {
+        eprintln!("vyges-syn: cannot write {out}: {e}");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `synthesize [--liberty LIB]... [--lef LEF]... -o OUT.v <slang arguments...>`: elaborate,
+/// synthesize, export into a database holding the LEFs, write it as Verilog.
+fn synthesize(args: &[String]) -> ExitCode {
+    let (mut out, mut lefs, mut rest) = (None, Vec::new(), Vec::new());
+    let mut libs = vyges_syn::library::Libraries::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--liberty" if rest.is_empty() && i + 1 < args.len() => {
+                if let Err(e) = libs.read(&args[i + 1]) {
+                    eprintln!("vyges-syn: cannot read {e}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+            }
+            "--lef" if rest.is_empty() && i + 1 < args.len() => {
+                lefs.push(args[i + 1].clone());
+                i += 1;
+            }
+            "-o" if rest.is_empty() && i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--" if rest.is_empty() => {}
+            a => rest.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let Some(out) = out else {
+        eprintln!("vyges-syn synthesize: needs -o OUT.v");
+        return ExitCode::from(2);
+    };
+    let mut db = vyges_opendb::Db::new();
+    for lef in &lefs {
+        if let Err(e) = db.read_lef(lef) {
+            eprintln!("vyges-syn: cannot read {lef}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    let mut g = match vyges_syn::synthesis::sv_elaborate(&rest, &libs) {
+        Ok(g) => g,
+        Err(vyges_syn::elab::frontend::Failed::Reported) => {
+            println!("[ERROR SYN-0001] Elaboration failed.");
+            return ExitCode::from(1);
+        }
+        Err(vyges_syn::elab::frontend::Failed::Error(code, msg)) => {
+            println!("[ERROR SYN-{code:04}] {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut abc = match vyges_abc_lib::Abc::start() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("vyges-syn: ABC: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = vyges_syn::synthesis::synthesize(&mut g, &libs, &mut abc) {
+        println!("{e}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = vyges_syn::flow::export::export_to_odb(&mut g, &mut db) {
+        println!("{e}");
+        return ExitCode::from(1);
+    }
+    let verilog = match vyges_opendb::verilog::write_verilog(&db, false, &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vyges-syn: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = std::fs::write(&out, verilog) {
         eprintln!("vyges-syn: cannot write {out}: {e}");
         return ExitCode::from(2);
     }
@@ -320,6 +412,7 @@ fn main() -> ExitCode {
         Some("ir-normalize") => ir_normalize(&args[1..]),
         Some("sv-elaborate") => sv_elaborate(&args[1..]),
         Some("ir-pass") => ir_pass(&args[1..]),
+        Some("synthesize") => synthesize(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-syn: unknown command `{other}`\n\n{USAGE}");

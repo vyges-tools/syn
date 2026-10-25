@@ -142,6 +142,8 @@ pub struct LibPort {
     pub size: u32,
     /// A bus (a bundle is not one: its blackbox port is one bit wide).
     pub is_bus: bool,
+    /// A bus's (from, to) indices.
+    pub bus: Option<(i64, i64)>,
     pub pwr_gnd: bool,
     /// Its `function` as written (an output's; a bus's is not kept).
     pub function: Option<String>,

@@ -34,6 +34,7 @@ fn lib_cell(c: &vyges_loom::liberty::Cell) -> LibCell {
             },
             size: p.size,
             is_bus: p.bus.is_some(),
+            bus: p.bus,
             pwr_gnd: p.pwr_gnd,
             function: if p.bus.is_none() { c.pins.get(&p.name).and_then(|pin| pin.function.clone()) } else { None },
         })
