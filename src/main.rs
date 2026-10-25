@@ -23,6 +23,9 @@ USAGE:
   vyges physical syn ir-normalize <in.ir> -o OUT.ir
                                   read a netlist in the IR text form, normalize it (topological
                                   order, dead logic dropped, loops broken) and write it back
+  vyges physical syn sv-elaborate --raw -o OUT.ir <slang arguments...>
+                                  elaborate SystemVerilog and write the netlist as the frontend
+                                  built it (before any pass), in the IR text form
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -44,7 +47,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "ir-normalize"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -52,7 +55,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize` is built; `run` refuses with exit 3."
+    "`ir-normalize` and `sv-elaborate --raw` are built; `run` and `sv-elaborate` without `--raw` refuse with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -113,6 +116,49 @@ fn ir_normalize(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `sv-elaborate --raw -o OUT <slang arguments...>`: elaborate, dump the graph as built.
+fn sv_elaborate(args: &[String]) -> ExitCode {
+    let (mut raw, mut out, mut rest) = (false, None, Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--raw" if rest.is_empty() => raw = true,
+            "-o" if rest.is_empty() && i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--" if rest.is_empty() => {}
+            a => rest.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let Some(out) = out else {
+        eprintln!("vyges-syn sv-elaborate: needs -o OUT.ir");
+        return ExitCode::from(2);
+    };
+    if !raw {
+        // The passes after elaboration (import, constant folding) are not built yet.
+        return refuse("sv-elaborate without --raw");
+    }
+    match vyges_syn::elab::frontend::elaborate(&rest, &[]) {
+        Ok(g) => {
+            if let Err(e) = std::fs::write(&out, g.dump()) {
+                eprintln!("vyges-syn: cannot write {out}: {e}");
+                return ExitCode::from(2);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(vyges_syn::elab::frontend::Failed::Reported) => {
+            println!("[ERROR SYN-0001] Elaboration failed.");
+            ExitCode::from(1)
+        }
+        Err(vyges_syn::elab::frontend::Failed::Error(code, msg)) => {
+            println!("[ERROR SYN-{code:04}] {msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -130,6 +176,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("ir-normalize") => ir_normalize(&args[1..]),
+        Some("sv-elaborate") => sv_elaborate(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-syn: unknown command `{other}`\n\n{USAGE}");

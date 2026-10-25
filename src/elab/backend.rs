@@ -562,3 +562,25 @@ fn as_net(v: &[Net]) -> Net {
     assert_eq!(v.len(), 1, "a one-bit value");
     v[0]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bwmux_is_one_mux_per_run_of_a_shared_select() {
+        // The reference cuts the select into runs of the SAME net and builds one mux per run (the
+        // corpus never reaches a mask with a repeated net: every mask it builds is per-bit).
+        let mut b = Backend::new();
+        let x = b.add_placeholder_signal(3, "", false).unwrap();
+        let y = b.add_placeholder_signal(3, "", false).unwrap();
+        let s = b.add_placeholder_signal(2, "", false).unwrap();
+        let out = b.bwmux(x, y, vec![s[0], s[0], s[1]]).unwrap();
+        assert_eq!(out.len(), 3);
+        let muxes: Vec<String> = b.graph.dump().lines().filter(|l| l.contains(" mux ")).map(str::to_string).collect();
+        assert_eq!(muxes.len(), 2, "{muxes:?}");
+        // Runs: bits 0-1 on s[0] (%9), bit 2 on s[1]; the cell takes (select, on-1, on-0).
+        assert!(muxes[0].ends_with(":2 = mux %9 %6:2 %3:2"), "{muxes:?}");
+        assert!(muxes[1].ends_with(":1 = mux %9+1 %6+2:1 %3+2:1"), "{muxes:?}");
+    }
+}
