@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The word-level netlist synthesis works on: nets, instances, the graph, and its text form.
 
+pub mod constant;
 pub mod dump;
 pub mod graph;
 pub mod instance;
