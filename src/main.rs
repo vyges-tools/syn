@@ -15,6 +15,8 @@
 
 use std::process::ExitCode;
 
+use vyges_syn::events;
+
 const USAGE: &str = "\
 vyges physical syn — integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core
 
@@ -49,11 +51,17 @@ USAGE:
 OPTIONS:
   -o FILE               write the report (or the output database) to FILE
   --json                machine-readable output instead of the text report
-  -q, --quiet           suppress non-essential output
-  -v, --verbose         extra detail on stderr
+  -q, --quiet           raise the causal trail's floor to error (VYGES_LOG)
+  -v, --verbose         lower it to debug: each step of the command
+                        (both go BEFORE the command: after it, -v is slang's)
   --describe            print a machine-readable JSON description of the command
   --bug-report          file a bug (central: vyges/community)
   --feature-request     request a feature (central)
+
+EVENTS:
+  The causal trail (vyges-events JSON lines) goes to stderr; netlists, reports and log lines go
+  to stdout or -o. SYN-INPUT, SYN-REFUSED, SYN-STEP (debug) and SYN-DONE (every command: its
+  status and exit code). An explicit VYGES_LOG wins over -q and -v.
 
 EXIT STATUS:
   0  ok
@@ -71,20 +79,17 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize`, `sv-elaborate` and `ir-pass` are built; `run` refuses with exit 3."
+    "`ir-normalize`, `sv-elaborate`, `ir-pass` and `synthesize` are built; `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
   "artifacts": [],
-  "assertion": { "id": "syn-ok", "field": "status", "pass_when": { "equals": "ok" } },
+  "assertion": { "id": "syn-ok", "field": "status", "pass_when": { "eq": "ok" } },
   "consumes": []
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
-    vyges_events::emit(
-        &vyges_events::Event::new("vyges-syn", vyges_events::Severity::Error, format!("{what} is not implemented in this build"))
-            .with_code("SYN-REFUSED"),
-    );
+    events::refused(&format!("{what} is not implemented in this build"));
     ExitCode::from(3)
 }
 
@@ -113,20 +118,20 @@ fn ir_normalize(args: &[String]) -> ExitCode {
     let text = match std::fs::read_to_string(&input) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("vyges-syn: cannot read {input}: {e}");
+            events::input(&format!("cannot read {input}: {e}"));
             return ExitCode::from(2);
         }
     };
     let mut g = match vyges_syn::ir::parse::parse(&text, None) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("vyges-syn: {input}: {e}");
+            events::input(&format!("{input}: {e}"));
             return ExitCode::from(2);
         }
     };
     g.normalize();
     if let Err(e) = std::fs::write(&out, g.dump()) {
-        eprintln!("vyges-syn: cannot write {out}: {e}");
+        events::input(&format!("cannot write {out}: {e}"));
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
@@ -152,7 +157,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
             }
             "--liberty" if i + 1 < args.len() => {
                 if let Err(e) = libs.read(&args[i + 1]) {
-                    eprintln!("vyges-syn: cannot read {e}");
+                    events::input(&format!("cannot read {e}"));
                     return ExitCode::from(2);
                 }
                 i += 1;
@@ -188,7 +193,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
             let text = match std::fs::read_to_string(&input) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("vyges-syn: cannot read {input}: {e}");
+                    events::input(&format!("cannot read {input}: {e}"));
                     return ExitCode::from(2);
                 }
             };
@@ -196,7 +201,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
             let mut g = match vyges_syn::ir::parse::parse(&text, Some(&lookup)) {
                 Ok(g) => g,
                 Err(e) => {
-                    eprintln!("vyges-syn: {input}: {e}");
+                    events::input(&format!("{input}: {e}"));
                     return ExitCode::from(2);
                 }
             };
@@ -220,7 +225,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
                     match vyges_abc_lib::Abc::start() {
                         Ok(a) => abc = Some(a),
                         Err(e) => {
-                            eprintln!("vyges-syn: ABC: {e}");
+                            events::input(&format!("ABC: {e}"));
                             return ExitCode::from(2);
                         }
                     }
@@ -256,7 +261,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
         }
     }
     if let Err(e) = std::fs::write(&out, g.dump()) {
-        eprintln!("vyges-syn: cannot write {out}: {e}");
+        events::input(&format!("cannot write {out}: {e}"));
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
@@ -272,7 +277,7 @@ fn synthesize(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--liberty" if rest.is_empty() && i + 1 < args.len() => {
                 if let Err(e) = libs.read(&args[i + 1]) {
-                    eprintln!("vyges-syn: cannot read {e}");
+                    events::input(&format!("cannot read {e}"));
                     return ExitCode::from(2);
                 }
                 i += 1;
@@ -297,7 +302,7 @@ fn synthesize(args: &[String]) -> ExitCode {
     let mut db = vyges_opendb::Db::new();
     for lef in &lefs {
         if let Err(e) = db.read_lef(lef) {
-            eprintln!("vyges-syn: cannot read {lef}: {e}");
+            events::input(&format!("cannot read {lef}: {e}"));
             return ExitCode::from(2);
         }
     }
@@ -312,10 +317,11 @@ fn synthesize(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    events::step("synthesize", &format!("elaborated {}", if g.name.is_empty() { "the design" } else { &g.name }));
     let mut abc = match vyges_abc_lib::Abc::start() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("vyges-syn: ABC: {e}");
+            events::input(&format!("ABC: {e}"));
             return ExitCode::from(2);
         }
     };
@@ -323,6 +329,7 @@ fn synthesize(args: &[String]) -> ExitCode {
         println!("{e}");
         return ExitCode::from(1);
     }
+    events::step("synthesize", "mapped onto the libraries' cells; exporting");
     if let Err(e) = vyges_syn::flow::export::export_to_odb(&mut g, &mut db) {
         println!("{e}");
         return ExitCode::from(1);
@@ -335,9 +342,10 @@ fn synthesize(args: &[String]) -> ExitCode {
         }
     };
     if let Err(e) = std::fs::write(&out, verilog) {
-        eprintln!("vyges-syn: cannot write {out}: {e}");
+        events::input(&format!("cannot write {out}: {e}"));
         return ExitCode::from(2);
     }
+    events::step("synthesize", &format!("wrote {out}"));
     ExitCode::SUCCESS
 }
 
@@ -351,7 +359,7 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
             "--raw" if rest.is_empty() => raw = true,
             "--liberty" if rest.is_empty() && i + 1 < args.len() => {
                 if let Err(e) = libs.read(&args[i + 1]) {
-                    eprintln!("vyges-syn: cannot read {e}");
+                    events::input(&format!("cannot read {e}"));
                     return ExitCode::from(2);
                 }
                 i += 1;
@@ -377,7 +385,7 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
     match result {
         Ok(g) => {
             if let Err(e) = std::fs::write(&out, g.dump()) {
-                eprintln!("vyges-syn: cannot write {out}: {e}");
+                events::input(&format!("cannot write {out}: {e}"));
                 return ExitCode::from(2);
             }
             ExitCode::SUCCESS
@@ -393,8 +401,35 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
     }
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// The exit code's number, for the trail.
+fn code_of(c: ExitCode) -> u8 {
+    (0..=u8::MAX).find(|&n| ExitCode::from(n) == c).unwrap_or(u8::MAX)
+}
+
+/// The trail's flags: before the command only, since a command's arguments run on into slang's.
+const TRAIL_FLAGS: &[&str] = &["-q", "--quiet", "-v", "--verbose"];
+
+pub fn main() -> ExitCode {
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    let lead = all.iter().take_while(|a| TRAIL_FLAGS.contains(&a.as_str())).count();
+    // ⛔ Both flags SET SOMETHING: `vyges-events` reads its floor from `VYGES_LOG` once, so they
+    // land there before the first event. An explicit `VYGES_LOG` in the environment wins.
+    if std::env::var_os("VYGES_LOG").is_none() {
+        if all[..lead].iter().any(|a| a == "-q" || a == "--quiet") {
+            std::env::set_var("VYGES_LOG", "error");
+        } else if lead > 0 {
+            std::env::set_var("VYGES_LOG", "debug");
+        }
+    }
+    let args = &all[lead..];
+    let code = run(args);
+    if let Some(cmd) = args.first().filter(|c| COMMANDS.contains(&c.as_str())) {
+        events::done(cmd, code_of(code));
+    }
+    code
+}
+
+fn run(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
@@ -425,6 +460,14 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    // Rule: the trail's DONE event reports the number the process exits with.
+    #[test]
+    fn the_trail_reports_the_exit_code_given() {
+        for n in [0, 1, 2, 3] {
+            assert_eq!(code_of(ExitCode::from(n)), n);
+        }
+    }
+
     #[test]
     fn the_descriptor_is_valid_json_with_a_legal_maturity() {
         let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
@@ -433,6 +476,8 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
+        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
+        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
     }
 
     #[test]

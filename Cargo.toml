@@ -9,6 +9,11 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/syn"
 build = "build.rs"
 
+[features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = []
+
 [dependencies]
 serde_json = "1"
 # The causal trail. ⚠️ `default-features = false` as in the other engines: the trail is
