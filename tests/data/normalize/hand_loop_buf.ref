@@ -1,0 +1,4 @@
+%3:1 = input "a"
+%4:0 = output "y" %6
+%5:1 = loop_breaker %6
+%6:1 = xor %3 %5

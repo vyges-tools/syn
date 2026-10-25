@@ -1,0 +1,6 @@
+%3:1 = input "clk"
+%4:1 = input "d"
+%5:0 = output "q" %6
+%6:1 = dff %7 clk=%3
+%7:1 = dff %8 clk=%3
+%8:1 = and %4 %6

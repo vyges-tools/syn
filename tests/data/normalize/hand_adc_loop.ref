@@ -1,0 +1,5 @@
+%3:2 = input "a"
+%5:0 = output "y" %8:3
+%6:1 = loop_breaker %8
+%7:1 = loop_breaker %8+1:1
+%8:3 = adc %3:2 [ %7 %6 ] 0

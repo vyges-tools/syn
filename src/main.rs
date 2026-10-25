@@ -20,6 +20,9 @@ vyges physical syn — integrated logic synthesis from RTL to a mapped netlist, 
 
 USAGE:
   vyges physical syn run  <job>  RTL to a technology-mapped netlist
+  vyges physical syn ir-normalize <in.ir> -o OUT.ir
+                                  read a netlist in the IR text form, normalize it (topological
+                                  order, dead logic dropped, loops broken) and write it back
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -41,7 +44,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -49,7 +52,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "No command is implemented yet: every command refuses with exit 3."
+    "`ir-normalize` is built; `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -64,6 +67,50 @@ fn refuse(what: &str) -> ExitCode {
             .with_code("SYN-REFUSED"),
     );
     ExitCode::from(3)
+}
+
+/// `ir-normalize IN -o OUT`: parse, normalize, dump.
+fn ir_normalize(args: &[String]) -> ExitCode {
+    let (mut input, mut out) = (None, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" if i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 1;
+            }
+            a if input.is_none() && !a.starts_with('-') => input = Some(a.to_string()),
+            a => {
+                eprintln!("vyges-syn ir-normalize: unexpected argument `{a}`");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let (Some(input), Some(out)) = (input, out) else {
+        eprintln!("vyges-syn ir-normalize: needs <in.ir> -o OUT.ir");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(&input) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vyges-syn: cannot read {input}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut g = match vyges_syn::ir::parse::parse(&text, None) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("vyges-syn: {input}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    g.normalize();
+    if let Err(e) = std::fs::write(&out, g.dump()) {
+        eprintln!("vyges-syn: cannot write {out}: {e}");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
@@ -82,6 +129,7 @@ fn main() -> ExitCode {
             println!("{DESCRIBE}");
             ExitCode::SUCCESS
         }
+        Some("ir-normalize") => ir_normalize(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-syn: unknown command `{other}`\n\n{USAGE}");

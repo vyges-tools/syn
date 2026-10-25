@@ -1,0 +1,5 @@
+%3:1 = input "i3"
+%4:3 = input "i4"
+%7:1 = input "i7"
+%8:1 = input "i8"
+%9:0 = output "o20" %4+1:1

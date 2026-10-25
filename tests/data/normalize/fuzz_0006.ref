@@ -1,0 +1,15 @@
+%3:1 = input "i3"
+%4:3 = input "i4"
+%7:2 = input "i7"
+%9:1 = input "i9"
+%10:1 = input "i10"
+%11:0 = output "o18" %13
+%12:0 = output "o19" [ %20 %3 %4+2 ]
+%13:1 = and %4+2:1 %7+1:1
+%14:1 = loop_breaker %20
+%15:1 = loop_breaker %20
+%16:1 = and %15 %4
+%17:1 = and %16 %7+1:1
+%18:1 = loop_breaker %19
+%19:1 = ult [ %17 %14 ] [ %18 %3 ]
+%20:1 = and %7 %19

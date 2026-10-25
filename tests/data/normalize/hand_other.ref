@@ -1,0 +1,7 @@
+%3:2 = input "a"
+%5:1 = other "CELL" {
+  input "A" = %3:2
+  %5:1 = output "Y"
+}
+%6:0 = output "y" %7
+%7:1 = not %5

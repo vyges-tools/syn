@@ -1,0 +1,3 @@
+%3:1 = input "a"
+%4:0 = output "y" %3
+%5:0 = name "n" 0 1 tentative %3
