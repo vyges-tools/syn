@@ -197,7 +197,7 @@ fn write_operands(os: &mut String, g: &Graph, kind: &Kind, id: u32) {
                         let _ = writeln!(os, "  %{}:{pw} = output \"{}\"", id + out_off, port.name);
                         out_off += pw;
                     }
-                    LibDirection::Other => {}
+                    LibDirection::Bidirect | LibDirection::Other => {}
                 }
             }
             os.push('}');

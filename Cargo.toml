@@ -18,6 +18,9 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 # slang + the sv-elab frontend, pinned and statically linked (Bazel), behind a backend callback.
 vyges-slang-lib = { git = "https://github.com/vyges-tools/slang-lib", branch = "main" }
 
+# Liberty: the library cells a design instantiates.
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main" }
+
 [[bin]]
 name = "vyges-syn"
 path = "src/main.rs"
@@ -28,3 +31,6 @@ path = "src/lib.rs"
 
 [patch."https://github.com/vyges-tools/slang-lib"]
 vyges-slang-lib = { path = "../vyges-tools-slang-lib" }
+
+[patch."https://github.com/vyges-tools/loom.git"]
+vyges-loom = { path = "../vyges-tools-loom" }

@@ -23,10 +23,11 @@ USAGE:
   vyges physical syn ir-normalize <in.ir> -o OUT.ir
                                   read a netlist in the IR text form, normalize it (topological
                                   order, dead logic dropped, loops broken) and write it back
-  vyges physical syn sv-elaborate [--raw] -o OUT.ir <slang arguments...>
+  vyges physical syn sv-elaborate [--raw] [--liberty LIB]... -o OUT.ir <slang arguments...>
                                   elaborate SystemVerilog and write the netlist in the IR text
-                                  form, cleaned up (constants folded); --raw: as the frontend
-                                  built it, before any pass
+                                  form, cleaned up (library cells imported, constants folded);
+                                  --raw: as the frontend built it, before any pass; --liberty:
+                                  read a library, whose cells the design may instantiate
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -56,7 +57,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize` and `sv-elaborate` are built (no Liberty cells imported yet); `run` refuses with exit 3."
+    "`ir-normalize` and `sv-elaborate` are built; `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -117,13 +118,21 @@ fn ir_normalize(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sv-elaborate [--raw] -o OUT <slang arguments...>`: elaborate (and clean up), dump the graph.
+/// `sv-elaborate [--raw] [--liberty LIB]... -o OUT <slang arguments...>`: elaborate (and clean up), dump the graph.
 fn sv_elaborate(args: &[String]) -> ExitCode {
     let (mut raw, mut out, mut rest) = (false, None, Vec::new());
+    let mut libs = vyges_syn::library::Libraries::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--raw" if rest.is_empty() => raw = true,
+            "--liberty" if rest.is_empty() && i + 1 < args.len() => {
+                if let Err(e) = libs.read(&args[i + 1]) {
+                    eprintln!("vyges-syn: cannot read {e}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+            }
             "-o" if rest.is_empty() && i + 1 < args.len() => {
                 out = Some(args[i + 1].clone());
                 i += 1;
@@ -137,7 +146,11 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
         eprintln!("vyges-syn sv-elaborate: needs -o OUT.ir");
         return ExitCode::from(2);
     };
-    let result = if raw { vyges_syn::elab::frontend::elaborate(&rest, &[]) } else { vyges_syn::synthesis::sv_elaborate(&rest) };
+    let result = if raw {
+        vyges_syn::elab::frontend::elaborate(&rest, &libs.blackboxes())
+    } else {
+        vyges_syn::synthesis::sv_elaborate(&rest, &libs)
+    };
     match result {
         Ok(g) => {
             if let Err(e) = std::fs::write(&out, g.dump()) {

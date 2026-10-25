@@ -7,4 +7,5 @@
 pub mod elab;
 pub mod flow;
 pub mod ir;
+pub mod library;
 pub mod synthesis;

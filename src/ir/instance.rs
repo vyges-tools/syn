@@ -128,7 +128,9 @@ pub struct OtherInst {
 pub enum LibDirection {
     Input,
     Output,
-    /// Bidirectional, tristate, internal, power or ground.
+    /// `inout`: an input and an output to the importer, neither to the mapper.
+    Bidirect,
+    /// Tristate, internal, unknown, power or ground.
     Other,
 }
 
@@ -136,8 +138,10 @@ pub enum LibDirection {
 pub struct LibPort {
     pub name: String,
     pub direction: LibDirection,
-    /// Bits (1 unless a bus).
+    /// Bits: a bus's width, a bundle's member count, otherwise 1.
     pub size: u32,
+    /// A bus (a bundle is not one: its blackbox port is one bit wide).
+    pub is_bus: bool,
     pub pwr_gnd: bool,
 }
 
