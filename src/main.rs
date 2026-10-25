@@ -23,9 +23,10 @@ USAGE:
   vyges physical syn ir-normalize <in.ir> -o OUT.ir
                                   read a netlist in the IR text form, normalize it (topological
                                   order, dead logic dropped, loops broken) and write it back
-  vyges physical syn sv-elaborate --raw -o OUT.ir <slang arguments...>
-                                  elaborate SystemVerilog and write the netlist as the frontend
-                                  built it (before any pass), in the IR text form
+  vyges physical syn sv-elaborate [--raw] -o OUT.ir <slang arguments...>
+                                  elaborate SystemVerilog and write the netlist in the IR text
+                                  form, cleaned up (constants folded); --raw: as the frontend
+                                  built it, before any pass
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -55,7 +56,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize` and `sv-elaborate --raw` are built; `run` and `sv-elaborate` without `--raw` refuse with exit 3."
+    "`ir-normalize` and `sv-elaborate` are built (no Liberty cells imported yet); `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -116,7 +117,7 @@ fn ir_normalize(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sv-elaborate --raw -o OUT <slang arguments...>`: elaborate, dump the graph as built.
+/// `sv-elaborate [--raw] -o OUT <slang arguments...>`: elaborate (and clean up), dump the graph.
 fn sv_elaborate(args: &[String]) -> ExitCode {
     let (mut raw, mut out, mut rest) = (false, None, Vec::new());
     let mut i = 0;
@@ -136,11 +137,8 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
         eprintln!("vyges-syn sv-elaborate: needs -o OUT.ir");
         return ExitCode::from(2);
     };
-    if !raw {
-        // The passes after elaboration (import, constant folding) are not built yet.
-        return refuse("sv-elaborate without --raw");
-    }
-    match vyges_syn::elab::frontend::elaborate(&rest, &[]) {
+    let result = if raw { vyges_syn::elab::frontend::elaborate(&rest, &[]) } else { vyges_syn::synthesis::sv_elaborate(&rest) };
+    match result {
         Ok(g) => {
             if let Err(e) = std::fs::write(&out, g.dump()) {
                 eprintln!("vyges-syn: cannot write {out}: {e}");

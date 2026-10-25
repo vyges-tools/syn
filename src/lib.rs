@@ -5,4 +5,6 @@
 //! the command runs them.
 
 pub mod elab;
+pub mod flow;
 pub mod ir;
+pub mod synthesis;
