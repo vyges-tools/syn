@@ -143,6 +143,22 @@ pub struct LibPort {
     /// A bus (a bundle is not one: its blackbox port is one bit wide).
     pub is_bus: bool,
     pub pwr_gnd: bool,
+    /// Its `function` as written (an output's; a bus's is not kept).
+    pub function: Option<String>,
+}
+
+/// A cell's one `ff` or `latch` group, as written.
+#[derive(Clone, Debug)]
+pub struct LibSeq {
+    pub latch: bool,
+    /// The state variable the group's outputs read (`ff (IQ, IQN)`: `IQ`).
+    pub iq: String,
+    /// `clocked_on` (a latch: `enable`), `next_state` (a latch: `data_in`), `clear`, `preset`, as
+    /// written.
+    pub clocked_on: Option<String>,
+    pub next_state: Option<String>,
+    pub clear: Option<String>,
+    pub preset: Option<String>,
 }
 
 /// What the IR needs of a library cell, ports in the library's declaration order.
@@ -153,6 +169,10 @@ pub struct LibCell {
     pub is_macro: bool,
     pub is_sequential: bool,
     pub ports: Vec<LibPort>,
+    /// `dont_use : true`.
+    pub dont_use: bool,
+    /// Its one `ff` / `latch` group, when it has exactly one (and no bank or `statetable`).
+    pub seq: Option<LibSeq>,
 }
 
 #[derive(Clone, Debug)]

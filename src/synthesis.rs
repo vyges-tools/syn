@@ -20,3 +20,9 @@ pub fn sv_elaborate(args: &[String], libs: &Libraries) -> Result<Graph, Failed> 
     g.normalize();
     Ok(g)
 }
+
+/// The first ABC round trip of `synthesize`: structural hashing and fraiging.
+pub const ABC_FRAIG: &str = "&ps; &st; &fraig -v -w;";
+
+/// The second: rewriting, a 6-input mapping and rewriting again.
+pub const ABC_DC2: &str = "&ps; &st; &dc2 -v; &dc2 -v; &if -g -K 6; &dc2 -v; &dc2 -v; &dc2 -v; &ps";

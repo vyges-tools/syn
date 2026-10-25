@@ -7,7 +7,7 @@ use std::sync::Arc;
 use vyges_loom::liberty::{Lib, PortDirection};
 use vyges_slang_lib::elab as fe;
 
-use crate::ir::instance::{LibCell, LibDirection, LibPort};
+use crate::ir::instance::{LibCell, LibDirection, LibPort, LibSeq};
 
 /// One library's cells, by name (the order its cells are walked in).
 struct Library {
@@ -35,9 +35,76 @@ fn lib_cell(c: &vyges_loom::liberty::Cell) -> LibCell {
             size: p.size,
             is_bus: p.bus.is_some(),
             pwr_gnd: p.pwr_gnd,
+            function: if p.bus.is_none() { c.pins.get(&p.name).and_then(|pin| pin.function.clone()) } else { None },
         })
         .collect();
-    LibCell { name: c.name.clone(), area: c.area as f32, is_macro: c.is_macro, is_sequential: c.is_seq, ports }
+    let unquote = |v: &String| v.trim().trim_matches('"').to_string();
+    // A latch's enable and data_in sit where a flip-flop's clocked_on and next_state do, as the
+    // reference's one sequential record holds them.
+    let seq = c.seq_group.as_ref().map(|s| LibSeq {
+        latch: s.latch,
+        iq: s.iq.clone(),
+        clocked_on: s.attrs.get(if s.latch { "enable" } else { "clocked_on" }).map(unquote),
+        next_state: s.attrs.get(if s.latch { "data_in" } else { "next_state" }).map(unquote),
+        clear: s.attrs.get("clear").map(unquote),
+        preset: s.attrs.get("preset").map(unquote),
+    });
+    LibCell {
+        name: c.name.clone(),
+        area: c.area as f32,
+        is_macro: c.is_macro,
+        is_sequential: c.is_seq,
+        ports,
+        dont_use: c.dont_use,
+        seq,
+    }
+}
+
+/// Every library, in read order, and in each its cells by name: the order the reference walks them.
+impl Libraries {
+    pub fn cells(&self) -> impl Iterator<Item = &Arc<LibCell>> {
+        self.libs.iter().flat_map(|l| l.cells.values())
+    }
+}
+
+/// A Liberty boolean expression that is one port, or the complement of one port: (non-inverted,
+/// the port's name). `None` for anything else — a constant, an operator, a double complement.
+/// Complements are `!` before and `'` after, parentheses anywhere around.
+pub fn pin_expr(text: &str) -> Option<(bool, String)> {
+    let mut negations = 0;
+    let mut name: Option<String> = None;
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'(' | b')' => i += 1,
+            b'!' | b'\'' => {
+                negations += 1;
+                i += 1;
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' || c == b'[' || c == b']' || c == b'.' || c == b'$' || c == b':' => {
+                if name.is_some() {
+                    // a second operand: an operator, explicit or implied
+                    return None;
+                }
+                let start = i;
+                while i < b.len() && !matches!(b[i], b' ' | b'\t' | b'(' | b')' | b'!' | b'\'' | b'*' | b'&' | b'+' | b'|' | b'^') {
+                    i += 1;
+                }
+                name = Some(text[start..i].to_string());
+            }
+            _ => return None,
+        }
+    }
+    let name = name?;
+    if name == "0" || name == "1" {
+        return None;
+    }
+    match negations {
+        0 => Some((true, name)),
+        1 => Some((false, name)),
+        _ => None,
+    }
 }
 
 impl Libraries {

@@ -28,6 +28,15 @@ USAGE:
                                   form, cleaned up (library cells imported, constants folded);
                                   --raw: as the frontend built it, before any pass; --liberty:
                                   read a library, whose cells the design may instantiate
+  vyges physical syn ir-pass [--liberty LIB]... <in.ir> -o OUT.ir PASS...
+                                  read a netlist in the IR text form (its library cells imported),
+                                  run the passes in order, write it back. PASS: normalize, opt,
+                                  bitblast, bitblast-no-arith, liveness, abc-fraig, abc-dc2
+                                  (the ABC round trips of synthesize), map-sequentials
+  vyges physical syn ir-pass [--liberty LIB]... -o OUT.ir PASS... --sv <slang arguments...>
+                                  the same on the design as sv-elaborate leaves it, in memory
+                                  (what the text form does not carry, register reset and clear
+                                  values, kept)
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -49,7 +58,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -57,7 +66,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize` and `sv-elaborate` are built; `run` refuses with exit 3."
+    "`ir-normalize`, `sv-elaborate` and `ir-pass` are built; `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -111,6 +120,128 @@ fn ir_normalize(args: &[String]) -> ExitCode {
         }
     };
     g.normalize();
+    if let Err(e) = std::fs::write(&out, g.dump()) {
+        eprintln!("vyges-syn: cannot write {out}: {e}");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ir-pass [--liberty LIB]... IN -o OUT PASS...`: read as the reference's `syn::parse` reads (parse,
+/// then the library cells imported), run each pass, dump. `--sv ARGS...` in place of IN: the graph
+/// `sv_elaborate` leaves, never written out in between.
+fn ir_pass(args: &[String]) -> ExitCode {
+    let (mut input, mut out, mut passes) = (None, None, Vec::new());
+    let mut sv: Option<Vec<String>> = None;
+    let mut libs = vyges_syn::library::Libraries::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sv" => {
+                sv = Some(args[i + 1..].to_vec());
+                break;
+            }
+            "-o" if i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--liberty" if i + 1 < args.len() => {
+                if let Err(e) = libs.read(&args[i + 1]) {
+                    eprintln!("vyges-syn: cannot read {e}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+            }
+            a if matches!(a, "normalize" | "opt" | "bitblast" | "bitblast-no-arith" | "liveness" | "abc-fraig" | "abc-dc2" | "map-sequentials") => {
+                passes.push(a.to_string())
+            }
+            a if input.is_none() && !a.starts_with('-') => input = Some(a.to_string()),
+            a => {
+                eprintln!("vyges-syn ir-pass: unexpected argument `{a}`");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(out) = out else {
+        eprintln!("vyges-syn ir-pass: needs -o OUT.ir");
+        return ExitCode::from(2);
+    };
+    let mut g = match (input, sv) {
+        (None, Some(sv)) => match vyges_syn::synthesis::sv_elaborate(&sv, &libs) {
+            Ok(g) => g,
+            Err(vyges_syn::elab::frontend::Failed::Reported) => {
+                println!("[ERROR SYN-0001] Elaboration failed.");
+                return ExitCode::from(1);
+            }
+            Err(vyges_syn::elab::frontend::Failed::Error(code, msg)) => {
+                println!("[ERROR SYN-{code:04}] {msg}");
+                return ExitCode::from(1);
+            }
+        },
+        (Some(input), None) => {
+            let text = match std::fs::read_to_string(&input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("vyges-syn: cannot read {input}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let lookup = |name: &str| libs.find_cell(name);
+            let mut g = match vyges_syn::ir::parse::parse(&text, Some(&lookup)) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("vyges-syn: {input}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            g.check_consistency();
+            if let Err(e) = vyges_syn::flow::import::import_targets(&mut g, &libs) {
+                println!("[ERROR SYN-{:04}] {}", e.code, e.message);
+                return ExitCode::from(1);
+            }
+            g
+        }
+        _ => {
+            eprintln!("vyges-syn ir-pass: needs one of <in.ir> or --sv <slang arguments...>");
+            return ExitCode::from(2);
+        }
+    };
+    let mut abc: Option<vyges_abc_lib::Abc> = None;
+    for pass in &passes {
+        match pass.as_str() {
+            p @ ("abc-fraig" | "abc-dc2") => {
+                if abc.is_none() {
+                    match vyges_abc_lib::Abc::start() {
+                        Ok(a) => abc = Some(a),
+                        Err(e) => {
+                            eprintln!("vyges-syn: ABC: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                let script = if p == "abc-fraig" { vyges_syn::synthesis::ABC_FRAIG } else { vyges_syn::synthesis::ABC_DC2 };
+                if let Err(e) = vyges_syn::flow::abc::abc_roundtrip(&mut g, abc.as_mut().unwrap(), script, -1) {
+                    println!("{e}");
+                    return ExitCode::from(1);
+                }
+            }
+            "normalize" => g.normalize(),
+            "opt" => vyges_syn::flow::constant_fold::constant_fold(&mut g),
+            "bitblast" => vyges_syn::flow::bitblast::bitblast(&mut g, true),
+            "map-sequentials" => {
+                if let Err(e) = vyges_syn::flow::sequential_mapper::map_sequentials(&mut g, &libs) {
+                    println!("[ERROR SYN-{:04}] {}", e.code, e.message);
+                    return ExitCode::from(1);
+                }
+            }
+            "liveness" => {
+                let (regs, combs) = vyges_syn::flow::liveness::liveness_opt(&mut g, false);
+                println!("[INFO SYN-0056] liveness: replaced {regs} register bits, {combs} combinational bits");
+            }
+            _ => vyges_syn::flow::bitblast::bitblast(&mut g, false),
+        }
+    }
     if let Err(e) = std::fs::write(&out, g.dump()) {
         eprintln!("vyges-syn: cannot write {out}: {e}");
         return ExitCode::from(2);
@@ -188,6 +319,7 @@ fn main() -> ExitCode {
         }
         Some("ir-normalize") => ir_normalize(&args[1..]),
         Some("sv-elaborate") => sv_elaborate(&args[1..]),
+        Some("ir-pass") => ir_pass(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-syn: unknown command `{other}`\n\n{USAGE}");

@@ -118,6 +118,15 @@ impl Graph {
         id
     }
 
+    /// The instance driving `net` and the bit of its output; None when its slot was emptied
+    /// (`remove_instance`) and a reader is left pointing at it.
+    pub fn try_resolve(&self, net: Net) -> Option<(InstId, u32)> {
+        match self.table[net.0 as usize] {
+            Slot::Ref(i, off) => Some((i, off)),
+            Slot::Void => None,
+        }
+    }
+
     /// The instance driving `net` and the bit of its output.
     pub fn resolve(&self, net: Net) -> (InstId, u32) {
         match self.table[net.0 as usize] {
@@ -134,6 +143,18 @@ impl Graph {
     pub fn output(&self, id: InstId) -> Bundle {
         let inst = self.inst(id);
         consecutive(Net(inst.base), inst.output_width())
+    }
+
+    /// Every net in id order: the net, its driver and the bit of the driver's output it is.
+    pub fn nets(&self) -> Vec<(Net, InstId, u32)> {
+        self.table
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match *s {
+                Slot::Ref(inst, off) => Some((Net(i as u32), inst, off)),
+                Slot::Void => None,
+            })
+            .collect()
     }
 
     /// Pad with empty slots so the next id is `target` (the parser honours declared ids).

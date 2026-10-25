@@ -19,6 +19,16 @@ fn const_char(n: Net) -> char {
     }
 }
 
+/// What drives `net` for printing: the instance (its identity, the bit, its output width). A slot
+/// emptied under a reader still prints: the reference reads the empty slot as an instance of its
+/// own, at bit 0 and of width 0, so it is its own one-bit run.
+fn driver(g: &Graph, net: Net) -> (u64, u32, u32) {
+    match g.try_resolve(net) {
+        Some((id, off)) => (id as u64, off, g.inst(id).output_width()),
+        None => (1 << 40 | net.0 as u64, 0, 0),
+    }
+}
+
 pub fn write_net(os: &mut String, g: &Graph, net: Net) {
     match net {
         Net::ZERO => os.push('0'),
@@ -26,7 +36,7 @@ pub fn write_net(os: &mut String, g: &Graph, net: Net) {
         Net::UNDEF => os.push('X'),
         Net::SENTINEL => os.push('E'),
         _ => {
-            let (_, offset) = g.resolve(net);
+            let (_, offset, _) = driver(g, net);
             let base = net.0 - offset;
             if offset > 0 {
                 let _ = write!(os, "%{base}+{offset}");
@@ -54,10 +64,10 @@ pub fn write_value(os: &mut String, g: &Graph, bv: &[Net]) {
         return;
     }
     // One run of a single cell's consecutive outputs.
-    let (inst0, off0) = g.resolve(bv[0]);
+    let (_, off0, width0) = driver(g, bv[0]);
     let first = bv[0].0;
     let w = bv.len() as u32;
-    let consecutive = off0 + w <= g.inst(inst0).output_width() && bv.iter().enumerate().all(|(i, n)| n.0 == first + i as u32);
+    let consecutive = off0 + w <= width0 && bv.iter().enumerate().all(|(i, n)| n.0 == first + i as u32);
     if consecutive {
         let base = first - off0;
         if w == 1 && off0 == 0 {
@@ -90,11 +100,11 @@ pub fn write_value(os: &mut String, g: &Graph, bv: &[Net]) {
                 j -= 1;
             }
         } else {
-            let (inst0, off0) = g.resolve(n);
+            let (inst0, off0, _) = driver(g, n);
             let start = i;
             i -= 1;
             while i >= 0 {
-                let (inst_i, off_i) = g.resolve(bv[i as usize]);
+                let (inst_i, off_i, _) = driver(g, bv[i as usize]);
                 if inst_i != inst0 || off_i as i64 != off0 as i64 - (start - i) {
                     break;
                 }
@@ -247,5 +257,37 @@ impl Graph {
             os.push('\n');
         }
         os
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{Graph, Kind};
+
+    // Rule: a slot emptied by removing its instance while something still reads it prints as
+    // `%<slot>`, a one-bit run of its own (the reference resolves the empty slot to itself, at bit 0,
+    // width 0). Mapping a two-bit register leaves its relocated output read by a dead forwarding
+    // buffer: bit 0 is replaced at the first relocation, bit 1 only at the second.
+    #[test]
+    fn an_emptied_slot_prints_as_its_own_net() {
+        let text = "%3:2 = input \"a\"\n%5:2 = dff %3:2 clk=%3\n%7:0 = output \"o\" %5:2\n";
+        let mut g: Graph = crate::ir::parse::parse(text, None).unwrap();
+        let mut it = g.instances();
+        let mut dff = None;
+        while let Some(id) = it.next(&g) {
+            if matches!(g.inst(id).kind, Kind::Dff(_)) {
+                dff = Some(id);
+            }
+        }
+        let dff = dff.unwrap();
+        for i in 0..2 {
+            let old = g.output(dff)[i];
+            g.force_replace(&[old], &[crate::ir::net::Net(3 + i as u32)]);
+        }
+        let last = g.output(dff)[0].0;
+        g.remove_instance(dff);
+        let dump = g.dump();
+        // the second forwarding buffer: bit 1 the input, bit 0 the emptied slot
+        assert!(dump.contains(&format!("buf [ %3+1 %{last} ]")), "{dump}");
     }
 }
