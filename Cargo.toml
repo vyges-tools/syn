@@ -29,6 +29,9 @@ vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main
 # Liberty: the library cells a design instantiates.
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main" }
 
+# Liberty timing arcs and gate tables: the resynthesis delay estimates.
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+
 # The design database the mapped netlist is exported into, and its Verilog writer.
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main" }
 
@@ -48,6 +51,9 @@ vyges-loom = { path = "../vyges-tools-loom" }
 
 [patch."https://github.com/vyges-tools/abc-lib"]
 vyges-abc-lib = { path = "../vyges-tools-abc-lib" }
+
+[patch."https://github.com/vyges-tools/sta.git"]
+vyges-sta = { path = "../vyges-tools-sta" }
 
 [patch."https://github.com/vyges-tools/opendb.git"]
 vyges-opendb = { path = "../vyges-tools-opendb" }
