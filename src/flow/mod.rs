@@ -3,6 +3,7 @@
 
 pub mod abc;
 pub mod acd;
+pub mod acd_resynth;
 pub mod bitblast;
 pub mod combinational_mapper;
 pub mod constant_fold;

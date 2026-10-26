@@ -35,6 +35,12 @@ vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
 # The design database the mapped netlist is exported into, and its Verilog writer.
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main" }
 
+# The timer `acd_resynth` asks, as `restructure` builds it: the netlist over the database (grt),
+# the libraries, constraints and buffer target slews (rsz), the logic constants (est).
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", features = ["cli"] }
+vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"] }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"] }
+
 [[bin]]
 name = "vyges-syn"
 path = "src/main.rs"
@@ -60,3 +66,18 @@ vyges-opendb = { path = "../vyges-tools-opendb" }
 
 [patch."https://github.com/vyges-tools/opendb-lib.git"]
 vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/rsz.git"]
+vyges-rsz = { path = "../vyges-tools-rsz" }
+
+[patch."https://github.com/vyges-tools/grt.git"]
+vyges-grt = { path = "../vyges-tools-grt" }
+
+[patch."https://github.com/vyges-tools/est.git"]
+vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/stt.git"]
+vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }

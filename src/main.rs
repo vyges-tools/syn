@@ -44,6 +44,16 @@ USAGE:
                                   elaborate SystemVerilog, synthesize it onto the libraries' cells
                                   and write the mapped netlist as structural Verilog; the LEFs (the
                                   technology first) give the cells' masters
+  vyges physical syn acd-resynth --liberty LIB... --sdc SDC [-o OUT.odb] [--verilog OUT.v] DESIGN.odb
+                                  [--apply] [--effort E] [--max-leaves N] [--max-cells N]
+                                  [--max-intermediate-leaves N] [--max-outerfans N]
+                                  [--exclude-buffers] [--allow-lateral] [--name-index N]
+                                  [--debug N] [--debug-acd N] [--trace]
+                                  resynthesize the logic around each gate output failing timing
+                                  from Ashenhurst-Curtis decompositions; --apply commits the
+                                  substitutions (instances remap<N>, nets remap_net<N>, N from
+                                  --name-index); --debug: the command's debug lines at that level;
+                                  --trace: the call-sequence trace lines
   vyges physical syn --describe
   vyges physical syn --help
   vyges physical syn --version
@@ -71,7 +81,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass", "synthesize"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass", "synthesize", "acd-resynth"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -79,7 +89,8 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize`, `sv-elaborate`, `ir-pass` and `synthesize` are built; `run` refuses with exit 3."
+    "`ir-normalize`, `sv-elaborate`, `ir-pass`, `synthesize` and `acd-resynth` are built; `run` refuses with exit 3.",
+    "`acd-resynth` times one scene without wire parasitics."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -349,6 +360,186 @@ fn synthesize(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `acd-resynth`: time the database, enumerate and evaluate the cuts around each failing gate
+/// output, and (with `--apply`) commit the substitutions; the database written back with `-o`.
+fn acd_resynth(args: &[String]) -> ExitCode {
+    use vyges_syn::flow::acd;
+    use vyges_syn::flow::acd_resynth::{Netlist, Options, Resynthesis};
+    let (mut liberty, mut sdc, mut out, mut verilog, mut pos) = (Vec::new(), None, None, None, Vec::new());
+    let mut o = Options::default();
+    let (mut name_index, mut debug, mut debug_acd, mut trace) = (0i64, 0u32, 0u32, false);
+    let mut it = args.iter();
+    while let Some(f) = it.next() {
+        let mut value = || it.next().cloned().ok_or(());
+        macro_rules! num {
+            ($t:ty) => {
+                match value().ok().and_then(|v| v.parse::<$t>().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("vyges-syn acd-resynth: {f} needs a number");
+                        return ExitCode::from(2);
+                    }
+                }
+            };
+        }
+        match f.as_str() {
+            "--liberty" | "--sdc" | "-o" | "--verilog" => {
+                let Ok(v) = value() else {
+                    eprintln!("vyges-syn acd-resynth: {f} needs a value");
+                    return ExitCode::from(2);
+                };
+                match f.as_str() {
+                    "--liberty" => liberty.push(v),
+                    "--sdc" => sdc = Some(v),
+                    "-o" => out = Some(v),
+                    _ => verilog = Some(v),
+                }
+            }
+            "--apply" => o.apply = true,
+            "--exclude-buffers" => o.exclude_buffers = true,
+            "--allow-lateral" => o.allow_lateral = true,
+            "--trace" => trace = true,
+            "--effort" => o.timing_opt_effort = num!(f32),
+            "--max-leaves" => o.max_leaves = num!(usize),
+            "--max-intermediate-leaves" => o.max_intermediate_leaves = num!(usize),
+            "--max-cells" => o.max_cells = num!(usize),
+            "--max-outerfans" => o.max_outerfans = num!(usize),
+            "--name-index" => name_index = num!(i64),
+            "--debug" => debug = num!(u32),
+            "--debug-acd" => debug_acd = num!(u32),
+            x if x.starts_with('-') => {
+                eprintln!("vyges-syn acd-resynth: unknown option `{x}`");
+                return ExitCode::from(2);
+            }
+            x => pos.push(x.to_string()),
+        }
+    }
+    let ([design], Some(sdc)) = (pos.as_slice(), sdc) else {
+        eprintln!("vyges-syn acd-resynth: needs a design database and --sdc FILE");
+        return ExitCode::from(2);
+    };
+    let mut libs = vyges_syn::library::Libraries::default();
+    let mut texts = Vec::new();
+    let mut corner = acd::Corner::default();
+    for l in &liberty {
+        let text = match std::fs::read_to_string(l) {
+            Ok(t) => t,
+            Err(e) => {
+                events::input(&format!("cannot read {l}: {e}"));
+                return ExitCode::from(2);
+            }
+        };
+        if let Err(e) = libs.read(l) {
+            events::input(&format!("cannot read {e}"));
+            return ExitCode::from(2);
+        }
+        match vyges_sta::liberty_parse::parse(&text).and_then(|g| vyges_sta::liberty::Library::read(&g)) {
+            Ok(lib) => corner.add(lib),
+            Err(e) => {
+                events::input(&format!("cannot read {l}: {e}"));
+                return ExitCode::from(2);
+            }
+        }
+        texts.push(text);
+    }
+    let sdc = match std::fs::read_to_string(&sdc) {
+        Ok(t) => t,
+        Err(e) => {
+            events::input(&format!("cannot read {sdc}: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+    let mut db = match vyges_opendb::Db::open(design) {
+        Ok(db) => db,
+        Err(e) => {
+            events::input(&format!("cannot read {design}: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+    let timer = vyges_syn::timer::Timer { liberties: texts, sdc };
+    let tlibs = match timer.libs() {
+        Ok(l) => l,
+        Err(e) => return refuse_why(&e),
+    };
+    let fixed_slew = match timer.target_slews(&db, &tlibs) {
+        Ok(s) => s,
+        Err(e) => return refuse_why(&e),
+    };
+    let time_scale = tlibs.default_library().map_or(1e-9, |l| l.time_scale);
+    let index = vyges_syn::flow::target_index::build_index(&libs);
+    events::step("acd-resynth", &format!("read {design}; timing"));
+    let say = |lines: &[String]| {
+        use std::io::Write;
+        let mut so = std::io::stdout().lock();
+        for l in lines {
+            let _ = writeln!(so, "{l}");
+        }
+    };
+    let found = timer.with_search(&db, &tlibs, |graph, search| {
+        let nl = Netlist::read(&db, graph)?;
+        let mc = match acd::MatchCache::new(&index, acd::MAX_BOUND_VARS) {
+            Ok(m) => m,
+            Err(e) => return Ok(Err(format!("[ERROR SYN-{:04}] {}", e.code, e.message))),
+        };
+        let dbg = acd::DebugLog { acd: debug_acd, acd_resynth: debug, lines: Vec::new() };
+        let mut r = match Resynthesis::init(&nl, graph, search, &corner, &libs, mc, fixed_slew, time_scale, dbg, trace) {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(e.0)),
+        };
+        r.resynthesize(o.clone());
+        say(&std::mem::take(&mut r.lines));
+        Ok(Ok((r.substitutions.clone(), r.stats.clone(), nl)))
+    });
+    let (subs, stats, nl) = match found {
+        Ok(Ok(x)) => x,
+        Ok(Err(line)) => {
+            println!("{line}");
+            return ExitCode::from(1);
+        }
+        Err(e) => return refuse_why(&e),
+    };
+    // The commit edits the database the timer read, so it runs once the timing is done with.
+    let (mut made, mut stats, mut lines) = (name_index, stats, Vec::new());
+    if o.apply {
+        if let Err(e) = vyges_syn::flow::acd_resynth::commit(&nl, &mut db, &subs, &mut made, trace, &mut stats, &mut lines) {
+            say(&lines);
+            return refuse_why(&e);
+        }
+    }
+    vyges_syn::flow::acd_resynth::report_stats(&stats, debug, &mut lines);
+    say(&lines);
+    if trace {
+        println!("VYG made {made}");
+    }
+    if let Some(out) = out {
+        if let Err(e) = db.write(&out) {
+            events::input(&format!("cannot write {out}: {e}"));
+            return ExitCode::from(2);
+        }
+        events::step("acd-resynth", &format!("wrote {out}"));
+    }
+    if let Some(v) = verilog {
+        match vyges_opendb::verilog::write_verilog(&db, false, &[]) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&v, text) {
+                    events::input(&format!("cannot write {v}: {e}"));
+                    return ExitCode::from(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("vyges-syn: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn refuse_why(why: &str) -> ExitCode {
+    events::refused(why);
+    ExitCode::from(3)
+}
+
 /// `sv-elaborate [--raw] [--liberty LIB]... -o OUT <slang arguments...>`: elaborate (and clean up), dump the graph.
 fn sv_elaborate(args: &[String]) -> ExitCode {
     let (mut raw, mut out, mut rest) = (false, None, Vec::new());
@@ -448,6 +639,7 @@ fn run(args: &[String]) -> ExitCode {
         Some("sv-elaborate") => sv_elaborate(&args[1..]),
         Some("ir-pass") => ir_pass(&args[1..]),
         Some("synthesize") => synthesize(&args[1..]),
+        Some("acd-resynth") => acd_resynth(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-syn: unknown command `{other}`\n\n{USAGE}");

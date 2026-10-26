@@ -14,6 +14,7 @@ pub mod flow;
 pub mod ir;
 pub mod library;
 pub mod synthesis;
+pub mod timer;
 
 /// The `vyges-syn` command-line entry (the binary's `main`), built into the library too so a
 /// suite binary can link every engine and run the one it is invoked as.

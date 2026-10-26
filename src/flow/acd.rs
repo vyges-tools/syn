@@ -557,6 +557,9 @@ impl<'a> MatchCache<'a> {
 #[derive(Clone, Debug)]
 pub struct GateNode {
     pub driver_port: Driver,
+    /// The netlist pin this node stands for, when it was read off the netlist (a synthesized
+    /// node has none): an index into the caller's pin table.
+    pub driver_pin: Option<usize>,
     /// Per input port of the cell (in its order): (a primary input, its index) or (a node, its index).
     pub fanins: Vec<(bool, usize)>,
 }
@@ -617,7 +620,7 @@ pub fn evaluate_function(net: &GateNetwork) -> TruthTable {
 // Timing on the Liberty gate tables
 
 /// `LibertyPort::capacitance()`: the largest of its rise/fall × min/max values.
-fn port_cap(p: &vyges_sta::liberty::Port) -> f32 {
+pub fn port_cap(p: &vyges_sta::liberty::Port) -> f32 {
     let c = &p.capacitance;
     max_f(max_f(c[RISE][0], c[RISE][1]), max_f(c[FALL][0], c[FALL][1]))
 }
@@ -1585,7 +1588,7 @@ impl<'n> Emitter<'n> {
         if let Some(driver) = &r.driver {
             let fanins = r.inputs.iter().map(|&v| self.resolve(v)).collect();
             self.binding.insert(r.output, (false, self.out.nodes.len()));
-            self.out.nodes.push(GateNode { driver_port: driver.clone(), fanins });
+            self.out.nodes.push(GateNode { driver_port: driver.clone(), driver_pin: None, fanins });
         }
         let mut inner: Vec<(bool, usize)> = Vec::new();
         if !r.split.is_empty() {
