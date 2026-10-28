@@ -90,13 +90,33 @@ const DESCRIBE: &str = r#"{
   "maturity": "discovered",
   "provenance_limitations": [
     "`ir-normalize`, `sv-elaborate`, `ir-pass`, `synthesize` and `acd-resynth` are built; `run` refuses with exit 3.",
-    "`acd-resynth` times one scene without wire parasitics."
+    "`acd-resynth` times one scene without wire parasitics.",
+    "The described call is `synthesize`: one SystemVerilog source elaborated, synthesized onto one Liberty's cells and written as structural Verilog. The technology LEF and the cell LEF are required: without a technology the export to the database stops (SYN-0033).",
+    "`synthesize` prints its log and writes the netlist; it has no --json output (a --json is read as an elaborator argument and elaboration fails), so emits_json is false and the result is the printed log.",
+    "Every argument after the first source is passed to the elaborator, so only an elaborator option (`top`) can follow it. More than one source, Liberty or cell LEF, include directories and defines need the engine's own arguments.",
+    "Synthesis establishes no claim about the design: the assertion is not_applicable. A design that does not elaborate or map exits 1 with its error line printed and writes no netlist.",
+    "input_hash covers the argument vector, not the content of the source, Liberty or LEF files it names, nor any file the source includes."
   ],
-  "invocation": { "args_template": ["run"], "emits_json": true },
-  "inputs": { "type": "object", "properties": {} },
-  "artifacts": [],
-  "assertion": { "id": "syn-ok", "field": "status", "pass_when": { "eq": "ok" } },
-  "consumes": []
+  "invocation": {
+    "args_template": ["synthesize", "--liberty", "{liberty}", "--lef", "{tech_lef}", "--lef", "{cell_lef}", "-o", "{out}", "{rtl}"],
+    "optional": [ { "arg": "top", "flag": "--top" } ],
+    "emits_json": false
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["liberty", "tech_lef", "cell_lef", "out", "rtl"],
+    "properties": {
+      "liberty": { "type": "string", "description": "Liberty library (.lib) whose cells the design is mapped onto" },
+      "tech_lef": { "type": "string", "description": "technology LEF (layers and vias), read first" },
+      "cell_lef": { "type": "string", "description": "standard-cell LEF giving the library cells' masters" },
+      "out": { "type": "string", "description": "structural Verilog netlist to write" },
+      "rtl": { "type": "string", "description": "SystemVerilog source file to synthesize" },
+      "top": { "type": "string", "description": "top-level module name, when the source holds more than one" }
+    }
+  },
+  "artifacts": [ { "role": "netlist", "from_arg": "out" } ],
+  "assertion": { "id": "syn-synthesized", "not_applicable": true },
+  "consumes": ["rtl", "liberty", "lef"]
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
@@ -668,8 +688,38 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
-        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
-        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
+        // Synthesis is a transform: it makes no claim a verdict could be read from.
+        assert_eq!(d["assertion"]["not_applicable"], true);
+
+        // Rule: the command an MCP caller is handed is one this build answers. Called with no
+        // arguments a built command is a usage error (2); a refused one is exit 3.
+        let inv = &d["invocation"];
+        let template: Vec<&str> = inv["args_template"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(COMMANDS.contains(&template[0]), "{}", template[0]);
+        assert_ne!(run(&[template[0].to_string()]), ExitCode::from(3), "`{}` is refused", template[0]);
+        // The command takes no --json (it would reach the elaborator), so none may be appended.
+        assert_eq!(inv["emits_json"], false);
+        // Rule: a `{token}` is a required input, and every optional is a declared input.
+        let props = d["inputs"]["properties"].as_object().unwrap();
+        let required: Vec<&str> = d["inputs"]["required"].as_array().expect("inputs name their required parameters").iter().map(|r| r.as_str().unwrap()).collect();
+        let tokens: Vec<&str> = template.iter().filter_map(|t| t.strip_prefix('{').and_then(|t| t.strip_suffix('}'))).collect();
+        assert!(!tokens.is_empty(), "the command needs its inputs");
+        for t in &tokens {
+            assert!(required.contains(t) && props.contains_key(*t), "{t}");
+        }
+        for r in &required {
+            assert!(tokens.contains(r), "required `{r}` is never passed");
+        }
+        for o in inv["optional"].as_array().into_iter().flatten() {
+            assert!(props.contains_key(o["arg"].as_str().unwrap()) && o["flag"].is_string(), "{o}");
+        }
+        // Rule: an artifact without `field`/`from_arg` is dropped by the registry without a word.
+        let artifacts = d["artifacts"].as_array().unwrap();
+        assert!(!artifacts.is_empty(), "the netlist written is the point of the call");
+        for a in artifacts {
+            assert!(a["role"].is_string() && a["from_arg"].as_str().is_some_and(|f| props.contains_key(f)), "{a}");
+        }
+        assert!(!d["consumes"].as_array().unwrap().is_empty());
     }
 
     #[test]
