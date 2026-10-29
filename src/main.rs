@@ -40,10 +40,12 @@ USAGE:
                                   the same on the design as sv-elaborate leaves it, in memory
                                   (what the text form does not carry, register reset and clear
                                   values, kept)
-  vyges physical syn synthesize [--liberty LIB]... [--lef LEF]... -o OUT.v <slang arguments...>
+  vyges physical syn synthesize [--liberty LIB]... [--lef LEF]... [--dont-use PATTERN]...
+                                  -o OUT.v <slang arguments...>
                                   elaborate SystemVerilog, synthesize it onto the libraries' cells
                                   and write the mapped netlist as structural Verilog; the LEFs (the
-                                  technology first) give the cells' masters
+                                  technology first) give the cells' masters; --dont-use withholds
+                                  the cells it names (globs, whitespace-separated) from mapping
   vyges physical syn acd-resynth --liberty LIB... --sdc SDC [-o OUT.odb] [--verilog OUT.v] DESIGN.odb
                                   [--apply] [--effort E] [--max-leaves N] [--max-cells N]
                                   [--max-intermediate-leaves N] [--max-outerfans N]
@@ -298,10 +300,10 @@ fn ir_pass(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `synthesize [--liberty LIB]... [--lef LEF]... -o OUT.v <slang arguments...>`: elaborate,
+/// `synthesize [--liberty LIB]... [--lef LEF]... [--dont-use PATTERN]... -o OUT.v <slang arguments...>`: elaborate,
 /// synthesize, export into a database holding the LEFs, write it as Verilog.
 fn synthesize(args: &[String]) -> ExitCode {
-    let (mut out, mut lefs, mut rest) = (None, Vec::new(), Vec::new());
+    let (mut out, mut lefs, mut rest, mut dont_use) = (None, Vec::new(), Vec::new(), Vec::new());
     let mut libs = vyges_syn::library::Libraries::default();
     let mut i = 0;
     while i < args.len() {
@@ -311,6 +313,10 @@ fn synthesize(args: &[String]) -> ExitCode {
                     events::input(&format!("cannot read {e}"));
                     return ExitCode::from(2);
                 }
+                i += 1;
+            }
+            "--dont-use" if rest.is_empty() && i + 1 < args.len() => {
+                dont_use.extend(args[i + 1].split_whitespace().map(str::to_string));
                 i += 1;
             }
             "--lef" if rest.is_empty() && i + 1 < args.len() => {
@@ -330,6 +336,18 @@ fn synthesize(args: &[String]) -> ExitCode {
         eprintln!("vyges-syn synthesize: needs -o OUT.v");
         return ExitCode::from(2);
     };
+    // After every library is read, as `set_dont_use` follows `read_liberty`.
+    let mut withheld = 0;
+    for p in &dont_use {
+        let n = libs.set_dont_use(p);
+        if n == 0 {
+            events::dont_use_unmatched(p);
+        }
+        withheld += n;
+    }
+    if !dont_use.is_empty() {
+        events::step("synthesize", &format!("{withheld} library cell(s) withheld by --dont-use"));
+    }
     let mut db = vyges_opendb::Db::new();
     for lef in &lefs {
         if let Err(e) = db.read_lef(lef) {

@@ -122,6 +122,23 @@ impl Libraries {
         self.libs.push(Library { cells });
     }
 
+    /// Withhold every cell whose name matches `pattern` (`*` any run, `?` any one character) from
+    /// mapping, as `set_dont_use` does: it sets the same flag as the Liberty `dont_use : true`
+    /// attribute (OpenSTA `LibertyCell::setDontUse`), which is the one the mappers read. Returns
+    /// how many cells it matched, across every library.
+    pub fn set_dont_use(&mut self, pattern: &str) -> usize {
+        let mut n = 0;
+        for lib in &mut self.libs {
+            for (name, cell) in lib.cells.iter_mut() {
+                if vyges_rsz::job::glob_match(pattern, name) {
+                    Arc::make_mut(cell).dont_use = true;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// The cell of this name in the first library, in read order, that has one.
     pub fn find_cell(&self, name: &str) -> Option<Arc<LibCell>> {
         self.libs.iter().find_map(|l| l.cells.get(name).cloned())
@@ -153,5 +170,31 @@ impl Libraries {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIB: &str = r#"library (l) {
+  cell (inv_0) { area : 1; pin (A) { direction : input; } pin (Y) { direction : output; function : "!A"; } }
+  cell (inv_1) { area : 2; pin (A) { direction : input; } pin (Y) { direction : output; function : "!A"; } }
+  cell (buf_1) { area : 2; dont_use : true; pin (A) { direction : input; } pin (Y) { direction : output; function : "A"; } }
+}"#;
+
+    /// `set_dont_use` marks exactly the cells its pattern names and leaves a cell the library
+    /// already withholds withheld; a pattern naming nothing reports 0 rather than failing.
+    #[test]
+    fn set_dont_use_marks_the_matching_cells_only() {
+        let mut libs = Libraries::default();
+        libs.add(&Lib::parse(LIB).unwrap());
+        let du = |l: &Libraries, n: &str| l.find_cell(n).unwrap().dont_use;
+        assert!(!du(&libs, "inv_0") && !du(&libs, "inv_1") && du(&libs, "buf_1"));
+        assert_eq!(libs.set_dont_use("*_0"), 1);
+        assert!(du(&libs, "inv_0") && !du(&libs, "inv_1") && du(&libs, "buf_1"));
+        assert_eq!(libs.set_dont_use("inv_?"), 2);
+        assert!(du(&libs, "inv_1"));
+        assert_eq!(libs.set_dont_use("nand*"), 0);
     }
 }

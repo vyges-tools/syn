@@ -12,6 +12,7 @@
 //! | `SYN-INPUT` | an input could not be read or written (exit 2) |
 //! | `SYN-REFUSED` | the command, or an option of it, is not implemented in this build (exit 3) |
 //! | `SYN-STEP` | one step of a command, at `debug` — the trail `-v` turns on |
+//! | `SYN-DONT-USE` | a `--dont-use` pattern matched no library cell, at `warn` (the run goes on) |
 //! | `SYN-DONE` | one invocation finished; its command, status and exit code |
 //!
 //! ⛔ **`SYN-DONE` is emitted for EVERY invocation of a command, whatever the outcome.** A run
@@ -30,6 +31,15 @@ pub fn input(msg: &str) {
 /// The command (or what it was asked to do) is not implemented in this build.
 pub fn refused(why: &str) {
     emit(&Event::new(TOOL, Severity::Error, why.to_string()).with_code("SYN-REFUSED"));
+}
+
+/// A `--dont-use` pattern that names no library cell: most likely a typo, or the wrong library.
+pub fn dont_use_unmatched(pattern: &str) {
+    emit(
+        &Event::new(TOOL, Severity::Warn, format!("--dont-use {pattern}: no library cell matches"))
+            .with_code("SYN-DONT-USE")
+            .with_objects(vec![format!("pattern:{pattern}")]),
+    );
 }
 
 /// One step of a command, at `debug`.
