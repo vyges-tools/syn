@@ -1,6 +1,6 @@
 [package]
 name = "vyges-syn"
-version = "0.1.49"
+version = "0.1.50"
 edition = "2021"
 description = "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core."
 license = "Apache-2.0"
