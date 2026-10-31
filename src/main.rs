@@ -101,7 +101,7 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["synthesize", "--liberty", "{liberty}", "--lef", "{tech_lef}", "--lef", "{cell_lef}", "-o", "{out}", "{rtl}"],
-    "optional": [ { "arg": "top", "flag": "--top" } ],
+    "optional": [ { "arg": "dont_use", "flag": "--dont-use" }, { "arg": "top", "flag": "--top" } ],
     "emits_json": false
   },
   "inputs": {
@@ -112,7 +112,8 @@ const DESCRIBE: &str = r#"{
       "tech_lef": { "type": "string", "description": "technology LEF (layers and vias), read first" },
       "cell_lef": { "type": "string", "description": "standard-cell LEF giving the library cells' masters" },
       "out": { "type": "string", "description": "structural Verilog netlist to write" },
-      "rtl": { "type": "string", "description": "SystemVerilog source file to synthesize" },
+      "rtl": { "type": ["string", "array"], "items": { "type": "string" }, "description": "SystemVerilog source files to synthesize, packages first (one entry per file)" },
+      "dont_use": { "type": ["string", "array"], "items": { "type": "string" }, "description": "cells withheld from mapping: globs, whitespace-separated (e.g. the PDK's synthesis and P&R exclude lists)" },
       "top": { "type": "string", "description": "top-level module name, when the source holds more than one" }
     }
   },
@@ -315,7 +316,10 @@ fn synthesize(args: &[String]) -> ExitCode {
                 }
                 i += 1;
             }
-            "--dont-use" if rest.is_empty() && i + 1 < args.len() => {
+            // anywhere, also after the sources: it is never a slang argument, and `vyges mcp`
+            // appends optional flags after the template's `{rtl}` (0.1.51: MCP `syn` with
+            // `dont_use` handed `--dont-use` to slang, which refused it)
+            "--dont-use" if i + 1 < args.len() => {
                 dont_use.extend(args[i + 1].split_whitespace().map(str::to_string));
                 i += 1;
             }
@@ -745,6 +749,44 @@ mod tests {
         // The dispatcher REFUSES a wrong group prefix, so the help must spell the right one.
         for c in COMMANDS {
             assert!(USAGE.contains(&format!("vyges physical syn {c}")), "{c}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
         }
     }
 }
