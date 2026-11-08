@@ -4,7 +4,7 @@ Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.
 
 > **Status: in development.** `synthesize` (SystemVerilog elaborated, synthesized onto the
 > libraries' cells and written as a structural Verilog netlist), `acd-resynth` (timing-driven
-> resynthesis of a linked netlist), `sv-elaborate`, `ir-pass` and `ir-normalize` are built; `run`
+> resynthesis of a linked netlist), `sv-elaborate`, `sv-ranges`, `ir-pass` and `ir-normalize` are built; `run`
 > refuses with exit 3. Commands are enabled one at a time as each is
 > validated.
 
@@ -18,6 +18,7 @@ Synthesis inside the suite, on the same AIG core as restructuring and formal, so
 vyges physical syn synthesize --liberty LIB... --lef TECH.lef --lef CELLS.lef -o OUT.v \
     -- top.sv [--top NAME] [other slang arguments]
 vyges physical syn sv-elaborate [--raw] [--liberty LIB]... -o OUT.ir <slang arguments...>
+vyges physical syn sv-ranges -o OUT.json <slang arguments...>
 vyges physical syn ir-pass [--liberty LIB]... <in.ir> -o OUT.ir PASS...
 vyges physical syn ir-normalize <in.ir> -o OUT.ir
 vyges physical syn acd-resynth --liberty LIB... --sdc SDC [--apply] [-o OUT.odb] [--verilog OUT.v] DESIGN.odb

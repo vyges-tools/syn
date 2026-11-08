@@ -30,6 +30,13 @@ USAGE:
                                   form, cleaned up (library cells imported, constants folded);
                                   --raw: as the frontend built it, before any pass; --liberty:
                                   read a library, whose cells the design may instantiate
+  vyges physical syn sv-ranges -o OUT.json <slang arguments...>
+                                  each vector's range as declared ([11:8]), by the name the
+                                  netlist gives it (elaboration numbers every vector's bits from
+                                  0), as JSON: ranges (name to [left, right]; an instance's
+                                  vector by its path, u_sub.t) and skipped; what a constraint
+                                  file's RTL bit index needs to be translated (`vyges physical
+                                  sdc map --ranges`)
   vyges physical syn ir-pass [--liberty LIB]... <in.ir> -o OUT.ir PASS...
                                   read a netlist in the IR text form (its library cells imported),
                                   run the passes in order, write it back. PASS: normalize, opt,
@@ -83,7 +90,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "ir-pass", "synthesize", "acd-resynth"];
+pub const COMMANDS: &[&str] = &["run", "ir-normalize", "sv-elaborate", "sv-ranges", "ir-pass", "synthesize", "acd-resynth"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -91,7 +98,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`ir-normalize`, `sv-elaborate`, `ir-pass`, `synthesize` and `acd-resynth` are built; `run` refuses with exit 3.",
+    "`ir-normalize`, `sv-elaborate`, `sv-ranges`, `ir-pass`, `synthesize` and `acd-resynth` are built; `run` refuses with exit 3.",
     "`acd-resynth` times one scene without wire parasitics.",
     "The described call is `synthesize`: one SystemVerilog source elaborated, synthesized onto one Liberty's cells and written as structural Verilog. The technology LEF and the cell LEF are required: without a technology the export to the database stops (SYN-0033).",
     "`synthesize` prints its log and writes the netlist; it has no --json output (a --json is read as an elaborator argument and elaboration fails), so emits_json is false and the result is the printed log.",
@@ -634,6 +641,45 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
     }
 }
 
+/// `sv-ranges -o OUT.json <slang arguments...>`: the declared vector ranges, as JSON.
+fn sv_ranges(args: &[String]) -> ExitCode {
+    let (mut out, mut rest) = (None, Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" if rest.is_empty() && i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--" if rest.is_empty() => {}
+            a => rest.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let Some(out) = out else {
+        eprintln!("vyges-syn sv-ranges: needs -o OUT.json");
+        return ExitCode::from(2);
+    };
+    match vyges_syn::elab::ranges::sv_ranges(&rest) {
+        Ok(r) => {
+            let ranges: serde_json::Map<String, serde_json::Value> =
+                r.ranges.iter().map(|(n, (l, rt))| (n.clone(), serde_json::json!([l, rt]))).collect();
+            let doc = serde_json::json!({ "schema": "vyges-syn-ranges/1.0", "ranges": ranges, "skipped": r.skipped });
+            if let Err(e) = std::fs::write(&out, format!("{doc:#}\n")) {
+                events::input(&format!("cannot write {out}: {e}"));
+                return ExitCode::from(2);
+            }
+            events::step("sv-ranges", &format!("{} range(s), {} skipped", r.ranges.len(), r.skipped.len()));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("{e}");
+            println!("[ERROR SYN-0001] Elaboration failed.");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// The exit code's number, for the trail.
 fn code_of(c: ExitCode) -> u8 {
     (0..=u8::MAX).find(|&n| ExitCode::from(n) == c).unwrap_or(u8::MAX)
@@ -679,6 +725,7 @@ fn run(args: &[String]) -> ExitCode {
         }
         Some("ir-normalize") => ir_normalize(&args[1..]),
         Some("sv-elaborate") => sv_elaborate(&args[1..]),
+        Some("sv-ranges") => sv_ranges(&args[1..]),
         Some("ir-pass") => ir_pass(&args[1..]),
         Some("synthesize") => synthesize(&args[1..]),
         Some("acd-resynth") => acd_resynth(&args[1..]),
