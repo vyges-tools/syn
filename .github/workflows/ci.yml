@@ -47,6 +47,8 @@ jobs:
           sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
 
       - name: Prebuilt archives
+        env:
+          GH_TOKEN: ${{ github.token }}   # authenticated bundle download (fetch-bundle.sh)
         run: |
           bash ../vyges-tools-abc-lib/scripts/fetch-bundle.sh "$RUNNER_TEMP/abc" >> "$GITHUB_ENV"
           bash ../vyges-tools-slang-lib/scripts/fetch-bundle.sh "$RUNNER_TEMP/slang" >> "$GITHUB_ENV"
