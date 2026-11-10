@@ -1,7 +1,5 @@
 # vyges-syn
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Integrated logic synthesis from RTL to a mapped netlist, on the shared AIG core.
 
 > **Status: in development.** `synthesize` (SystemVerilog elaborated, synthesized onto the
