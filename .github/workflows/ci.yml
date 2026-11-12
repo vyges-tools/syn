@@ -53,7 +53,7 @@ jobs:
           bash ../vyges-tools-abc-lib/scripts/fetch-bundle.sh "$RUNNER_TEMP/abc" >> "$GITHUB_ENV"
           bash ../vyges-tools-slang-lib/scripts/fetch-bundle.sh "$RUNNER_TEMP/slang" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
