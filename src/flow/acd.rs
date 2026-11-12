@@ -696,6 +696,8 @@ pub fn find_delay_lower_bound(corner: &Corner, cell_name: &str, fixed_slew: [f32
 /// least of minus each output's rise→rise and fall→fall entry.
 pub fn network_slack(problem: &SynthesisProblem, net: &GateNetwork, corner: &Corner, fixed_slew: [f32; 2]) -> f32 {
     let mut load = vec![0.0f32; net.nodes.len()];
+    // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+    #[allow(clippy::needless_range_loop)]
     for i in 0..problem.num_outputs() {
         let (is_pi, gate_idx) = net.outs[i];
         if !is_pi {
@@ -1648,6 +1650,8 @@ pub fn synthesize(
         });
     }
     let mut objective = Objective { min_slacks: [f32::NEG_INFINITY; 2], slack_cost_factor: [0.0; 2] };
+    // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+    #[allow(clippy::needless_range_loop)]
     for i in 0..problem.num_outputs().min(2) {
         objective.slack_cost_factor[i] = if problem.output(i).critical { -effort as f64 } else { 0.0 };
     }
