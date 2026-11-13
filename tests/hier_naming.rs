@@ -37,9 +37,13 @@ endmodule
 ";
 
 fn names(naming: &HierNaming) -> Result<Vec<String>, Failed> {
+    // One file per call: the tests run in parallel, and a shared file is truncated by one test
+    // while another elaborates it.
+    static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let k = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hier_naming");
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("design.sv");
+    let src = dir.join(format!("design-{k}.sv"));
     std::fs::write(&src, SRC).unwrap();
     let args = [src.to_string_lossy().into_owned(), "--top".into(), "top".into()];
     let g = vyges_syn::synthesis::elaborate(&args, &Libraries::default(), naming)?;
