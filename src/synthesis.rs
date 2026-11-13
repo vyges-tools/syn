@@ -51,6 +51,11 @@ pub fn synthesize(g: &mut Graph, libs: &Libraries, abc: &mut Abc) -> Result<(), 
     abc_roundtrip(g, abc, ABC_FRAIG, -1)?;
     bitblast(g, true);
     constant_fold(g);
+    // DIVERGENCE D1: the reference leaves division and modulo unmapped (dropped at export).
+    let divmods = crate::flow::bitblast::bitblast_divmod(g);
+    if divmods > 0 {
+        println!("[INFO SYN-0072] bitblasted {divmods} division/modulo cell(s) (not in the reference flow)");
+    }
     abc_roundtrip(g, abc, ABC_DC2, -1)?;
     map_sequentials(g, libs).map_err(reported)?;
     map_combinationals(g, libs).map_err(reported)?;

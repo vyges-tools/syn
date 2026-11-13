@@ -429,6 +429,88 @@ impl Bitblasted<'_> {
         }
     }
 
+    /// -x, or x, by `neg`: two's complement of `x` kept to its width.
+    fn cond_negate(&mut self, neg: Literal, x: &[Literal]) -> Vec<Literal> {
+        let inv: Vec<Literal> = x.iter().map(|&l| not(l)).collect();
+        let zero = vec![Literal::ZERO; x.len()];
+        let m = self.adder(&inv, &zero, Literal::ONE);
+        x.iter().zip(&m).map(|(&p, &q)| self.MUX(neg, q, p)).collect()
+    }
+
+    /// DIVERGENCE (vyges-syn D1, the reference has no rule): `/` and `%` with a run-time divisor,
+    /// built as Yosys's `techmap.v` builds them (the QoR reference ORFS runs). `$__div_mod_u`:
+    /// restoring division over WIDTH = the widest operand or result, one stage per quotient bit
+    /// from the top; stage s sets quotient bit s when the remainder is at least `B << s` (compared
+    /// at full width, so any of B's top s bits set means no) and then subtracts it. A zero divisor
+    /// gives an all-ones quotient and the dividend as remainder. Signed (`$__div_mod_trunc`): both
+    /// operands made non-negative, the quotient negated when their signs differ, the remainder
+    /// takes the dividend's sign. Flooring (`$__div_mod_floor`): a negative quotient with a remainder
+    /// is one lower, and a remainder whose signs differ from the divisor's has the divisor added.
+    fn divmod(&mut self, op: BinOp, a: &[Net], b: &[Net], n: usize) {
+        let signed = !matches!(op, BinOp::UDiv | BinOp::UMod);
+        let w = a.len().max(b.len()).max(n);
+        let ext = |s: &Self, v: &[Net]| -> Vec<Literal> {
+            let top = if signed { s.import(*v.last().unwrap()) } else { Literal::ZERO };
+            (0..w).map(|i| if i < v.len() { s.import(v[i]) } else { top }).collect()
+        };
+        let (av, bv) = (ext(self, a), ext(self, b));
+        let (an, bn) = if signed { (av[w - 1], bv[w - 1]) } else { (Literal::ZERO, Literal::ZERO) };
+        let au = if signed { self.cond_negate(an, &av) } else { av.clone() };
+        let bu = if signed { self.cond_negate(bn, &bv) } else { bv.clone() };
+        // $__div_mod_u
+        let mut rem = au;
+        let mut q = vec![Literal::ZERO; w];
+        for i in 0..w {
+            let s = w - 1 - i;
+            // B's top s bits all zero: else B << s exceeds every W-bit remainder.
+            let mut fits = Literal::ONE;
+            for &t in &bu[w - s..] {
+                fits = self.AND(fits, not(t));
+            }
+            let mut nd = vec![Literal::ONE; s];
+            nd.extend(bu[..w - s].iter().map(|&t| not(t)));
+            let diff = self.adder(&rem, &nd, Literal::ONE);
+            let ge = self.AND(fits, diff[w]);
+            q[s] = ge;
+            rem = (0..w).map(|k| self.MUX(ge, diff[k], rem[k])).collect();
+        }
+        let out: Vec<Literal> = match op {
+            BinOp::UDiv => q,
+            BinOp::UMod => rem,
+            BinOp::SDivTrunc => {
+                let d = self.XOR(an, bn);
+                self.cond_negate(d, &q)
+            }
+            BinOp::SModTrunc => self.cond_negate(an, &rem),
+            BinOp::SDivFloor => {
+                let d = self.XOR(an, bn);
+                let mut rz = Literal::ONE;
+                for &t in &rem {
+                    rz = self.AND(rz, not(t));
+                }
+                let negq = self.cond_negate(Literal::ONE, &q);
+                // -q - 1 is ~q
+                let alt: Vec<Literal> = q.iter().zip(&negq).map(|(&x, &y)| self.MUX(rz, y, not(x))).collect();
+                alt.iter().zip(&q).map(|(&x, &y)| self.MUX(d, x, y)).collect()
+            }
+            _ => {
+                // SModFloor
+                let rs = self.cond_negate(an, &rem);
+                let d = self.XOR(an, bn);
+                let mut nz = Literal::ZERO;
+                for &t in &rs {
+                    nz = self.OR(nz, t);
+                }
+                let fix = self.AND(nz, d);
+                let sum = self.adder(&bv, &rs, Literal::ZERO);
+                rs.iter().zip(&sum).map(|(&x, &y)| self.MUX(fix, y, x)).collect()
+            }
+        };
+        for (i, &r) in out.iter().take(n).enumerate() {
+            self.produce(i, r);
+        }
+    }
+
     /// Two literals per bit, combined by `f`.
     fn bitwise(&mut self, a: &[Net], b: &[Net], f: fn(&mut Self, Literal, Literal) -> Literal) {
         for i in 0..a.len() {
@@ -505,6 +587,11 @@ impl Bitblasted<'_> {
             Kind::Bin(BinOp::And, a, b) => self.bitwise(a, b, Self::AND),
             Kind::Bin(BinOp::Or, a, b) => self.bitwise(a, b, Self::OR),
             Kind::Bin(BinOp::Andnot, a, b) => self.bitwise(a, b, |s, x, y| s.AND(x, not(y))),
+            Kind::Bin(
+                op @ (BinOp::UDiv | BinOp::UMod | BinOp::SDivTrunc | BinOp::SModTrunc | BinOp::SDivFloor | BinOp::SModFloor),
+                a,
+                b,
+            ) => self.divmod(*op, a, b, self.replacement.len()),
             _ => unreachable!("not a bitblasted cell"),
         }
     }
@@ -524,6 +611,38 @@ fn is_bitblasted(kind: &Kind, blast_arith: bool) -> bool {
     }
 }
 
+fn is_divmod(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Bin(BinOp::UDiv | BinOp::UMod | BinOp::SDivTrunc | BinOp::SModTrunc | BinOp::SDivFloor | BinOp::SModFloor, ..)
+    )
+}
+
+/// DIVERGENCE (vyges-syn D1): replaces every division and modulo cell still in the graph by gates
+/// (see `divmod`). The reference has no such rule: its export drops these cells with a warning,
+/// leaving their outputs undriven. Run after constant folding, so a constant power-of-two divisor
+/// still becomes wiring there first, as in the reference.
+pub fn bitblast_divmod(g: &mut Graph) -> usize {
+    g.normalize();
+    let mut cache = BTreeMap::new();
+    let mut it = g.instances();
+    let mut count = 0;
+    while let Some(id) = it.next(g) {
+        if !is_divmod(&g.inst(id).kind) {
+            continue;
+        }
+        count += 1;
+        let kind = g.inst(id).kind.clone();
+        let width = g.inst(id).output_width() as usize;
+        let mut op = Bitblasted { g, and_cache: &mut cache, replacement: vec![Net::UNDEF; width] };
+        op.build(&kind);
+        let replacement = op.replacement;
+        let output = g.output(id);
+        g.replace(&output, &replacement, Equivalence::TwoValued, &[]);
+    }
+    count
+}
+
 /// Normalizes, then replaces every bitblasted cell, in slot order, by gates; the AND hash is
 /// shared by all of them. Cells the pass adds are not visited.
 pub fn bitblast(g: &mut Graph, blast_arith: bool) {
@@ -541,5 +660,93 @@ pub fn bitblast(g: &mut Graph, blast_arith: bool) {
         let replacement = op.replacement;
         let output = g.output(id);
         g.replace(&output, &replacement, Equivalence::TwoValued, &[]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value of `net` under the inputs `env` (name -> bits), through the gates the pass builds.
+    fn eval(g: &Graph, net: Net, env: &BTreeMap<String, u64>) -> bool {
+        if net == Net::ZERO {
+            return false;
+        }
+        if net == Net::ONE {
+            return true;
+        }
+        let (id, off) = g.resolve(net);
+        let o = off as usize;
+        match &g.inst(id).kind {
+            Kind::Input(name, _) => (env[name] >> o) & 1 == 1,
+            Kind::Buffer(a) => eval(g, a[o], env),
+            Kind::Not(a) => !eval(g, a[o], env),
+            Kind::Bin(BinOp::And, a, b) => eval(g, a[o], env) && eval(g, b[o], env),
+            Kind::Bin(BinOp::Andnot, a, b) => eval(g, a[o], env) && !eval(g, b[o], env),
+            Kind::Bin(BinOp::Or, a, b) => eval(g, a[o], env) || eval(g, b[o], env),
+            Kind::TieHigh => true,
+            Kind::TieLow => false,
+            k => panic!("unexpected cell after the pass: {}", k.keyword()),
+        }
+    }
+
+    // DIVERGENCE D1 (the reference `syn` has no rule; ORFS's Yosys `techmap.v` is the model):
+    // division and modulo are restoring division over the widest width; signed truncating
+    // negates the quotient when the signs differ and gives the remainder the dividend's sign;
+    // flooring rounds a negative quotient with a remainder down and adds the divisor to a
+    // remainder whose sign differs from it. A zero divisor gives the quotient Yosys gives (all
+    // ones, unsigned; +1 or -1 signed truncating by the dividend's sign; 0 or -1 flooring) and
+    // the dividend as remainder. Exhaustive at 4 bits for all six cells.
+    #[test]
+    fn division_and_modulo_bitblast_as_the_qor_reference_builds_them() {
+        const W: u32 = 4;
+        let mask = (1u64 << W) - 1;
+        let sx = |v: u64| -> i64 { ((v << (64 - W)) as i64) >> (64 - W) };
+        let ops = [BinOp::UDiv, BinOp::UMod, BinOp::SDivTrunc, BinOp::SModTrunc, BinOp::SDivFloor, BinOp::SModFloor];
+        for op in ops {
+            let mut g = Graph::new();
+            let a = g.add(Kind::Input("a".into(), W));
+            let b = g.add(Kind::Input("b".into(), W));
+            let y = g.add(Kind::Bin(op, a, b));
+            g.add(Kind::Output("y".into(), y));
+            assert_eq!(bitblast_divmod(&mut g), 1);
+            let mut it = g.instances();
+            let mut out = None;
+            while let Some(id) = it.next(&g) {
+                if let Kind::Output(_, v) = &g.inst(id).kind {
+                    out = Some(v.clone());
+                }
+            }
+            let out = out.unwrap();
+            for av in 0..=mask {
+                for bv in 0..=mask {
+                    let env = BTreeMap::from([("a".to_string(), av), ("b".to_string(), bv)]);
+                    let got = out.iter().enumerate().fold(0u64, |acc, (i, &n)| acc | (u64::from(eval(&g, n, &env)) << i));
+                    let (sa, sb) = (sx(av), sx(bv));
+                    let want = if bv == 0 {
+                        match op {
+                            BinOp::UDiv => mask,
+                            BinOp::SDivTrunc => (if sa < 0 { 1 } else { -1i64 }) as u64 & mask,
+                            BinOp::SDivFloor => (if sa < 0 { 0 } else { -1i64 }) as u64 & mask,
+                            _ => av,
+                        }
+                    } else {
+                        let tq = sa.wrapping_div(sb);
+                        let tr = sa.wrapping_rem(sb);
+                        let fl = tr != 0 && ((sa < 0) != (sb < 0));
+                        (match op {
+                            BinOp::UDiv => av.checked_div(bv).expect("a non-zero divisor") as i64,
+                            BinOp::UMod => (av % bv) as i64,
+                            BinOp::SDivTrunc => tq,
+                            BinOp::SModTrunc => tr,
+                            BinOp::SDivFloor => if fl { tq - 1 } else { tq },
+                            _ => if fl { tr + sb } else { tr },
+                        }) as u64
+                            & mask
+                    };
+                    assert_eq!(got, want, "{} a={av} b={bv}", op.keyword());
+                }
+            }
+        }
     }
 }
