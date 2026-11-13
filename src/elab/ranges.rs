@@ -70,7 +70,8 @@ pub fn declared_ranges(ast: &Value) -> Ranges {
     out
 }
 
-fn collect_bodies<'a>(v: &'a Value, bodies: &mut HashMap<u64, &'a Value>) {
+/// Every instance body slang printed in place, by its address.
+pub(crate) fn collect_bodies<'a>(v: &'a Value, bodies: &mut HashMap<u64, &'a Value>) {
     match v {
         Value::Object(o) => {
             if o.get("kind").and_then(Value::as_str) == Some("InstanceBody") {

@@ -3,4 +3,5 @@
 
 pub mod backend;
 pub mod frontend;
+pub mod hierarchy;
 pub mod ranges;

@@ -15,6 +15,7 @@
 
 use std::process::ExitCode;
 
+use vyges_syn::elab::hierarchy::HierNaming;
 use vyges_syn::events;
 
 const USAGE: &str = "\
@@ -25,11 +26,13 @@ USAGE:
   vyges physical syn ir-normalize <in.ir> -o OUT.ir
                                   read a netlist in the IR text form, normalize it (topological
                                   order, dead logic dropped, loops broken) and write it back
-  vyges physical syn sv-elaborate [--raw] [--liberty LIB]... -o OUT.ir <slang arguments...>
+  vyges physical syn sv-elaborate [--raw] [--liberty LIB]... [--hier-separator SEP]
+                                  [--keep-module NAME]... -o OUT.ir <slang arguments...>
                                   elaborate SystemVerilog and write the netlist in the IR text
                                   form, cleaned up (library cells imported, constants folded);
                                   --raw: as the frontend built it, before any pass; --liberty:
-                                  read a library, whose cells the design may instantiate
+                                  read a library, whose cells the design may instantiate;
+                                  --hier-separator, --keep-module: as for synthesize
   vyges physical syn sv-ranges -o OUT.json <slang arguments...>
                                   each vector's range as declared ([11:8]), by the name the
                                   netlist gives it (elaboration numbers every vector's bits from
@@ -48,11 +51,18 @@ USAGE:
                                   (what the text form does not carry, register reset and clear
                                   values, kept)
   vyges physical syn synthesize [--liberty LIB]... [--lef LEF]... [--dont-use PATTERN]...
+                                  [--hier-separator SEP] [--keep-module NAME]...
                                   -o OUT.v <slang arguments...>
                                   elaborate SystemVerilog, synthesize it onto the libraries' cells
                                   and write the mapped netlist as structural Verilog; the LEFs (the
                                   technology first) give the cells' masters; --dont-use withholds
-                                  the cells it names (globs, whitespace-separated) from mapping
+                                  the cells it names (globs, whitespace-separated) from mapping.
+                                  The netlist is flat. Its design names join a module-instance
+                                  boundary with SEP (default `.`, as elaborated; `/` names them as
+                                  Yosys `flatten -separator /`); an instance of a --keep-module
+                                  definition (names whitespace-separated, ORFS SYNTH_KEEP_MODULES)
+                                  is joined with `/`, as the reference names a kept module once
+                                  its netlist reader flattens it. Instance names stay u<N>
   vyges physical syn acd-resynth --liberty LIB... --sdc SDC [-o OUT.odb] [--verilog OUT.v] DESIGN.odb
                                   [--apply] [--effort E] [--max-leaves N] [--max-cells N]
                                   [--max-intermediate-leaves N] [--max-outerfans N]
@@ -132,6 +142,49 @@ const DESCRIBE: &str = r#"{
 fn refuse(what: &str) -> ExitCode {
     events::refused(&format!("{what} is not implemented in this build"));
     ExitCode::from(3)
+}
+
+/// `--hier-separator SEP` / `--keep-module NAMES` at `args[i]`, taken anywhere on the line (neither
+/// is a slang argument): Some(Ok) when one was read (its value consumed), Some(Err) for a bad one.
+fn hier_naming_flag(args: &[String], i: &mut usize, naming: &mut HierNaming) -> Option<Result<(), ExitCode>> {
+    let flag = args[*i].as_str();
+    if !matches!(flag, "--hier-separator" | "--keep-module") || *i + 1 >= args.len() {
+        return None;
+    }
+    *i += 1;
+    let v = &args[*i];
+    if flag == "--hier-separator" {
+        if v.is_empty() {
+            eprintln!("vyges-syn: --hier-separator needs a non-empty separator");
+            return Some(Err(ExitCode::from(2)));
+        }
+        naming.separator = Some(v.clone());
+        return Some(Ok(()));
+    }
+    for m in v.split_whitespace() {
+        // ORFS's second pattern (`name$*`, slang's per-specialization module names) needs the
+        // frontend's canonical bodies, which the flat elaboration does not report.
+        if m.contains('$') {
+            return Some(Err(refuse(&format!("--keep-module `{m}` (a specialization name; give the definition name)"))));
+        }
+        naming.keep_modules.push(m.to_string());
+    }
+    Some(Ok(()))
+}
+
+/// An elaboration failure as the run reports it: a kept module the design lacks is usage (2),
+/// anything else the design's (1).
+fn elab_failed(e: vyges_syn::elab::frontend::Failed) -> ExitCode {
+    match e {
+        vyges_syn::elab::frontend::Failed::Reported => {
+            println!("[ERROR SYN-0001] Elaboration failed.");
+            ExitCode::from(1)
+        }
+        vyges_syn::elab::frontend::Failed::Error(code, msg) => {
+            println!("[ERROR SYN-{code:04}] {msg}");
+            ExitCode::from(if code == 73 { 2 } else { 1 })
+        }
+    }
 }
 
 /// `ir-normalize IN -o OUT`: parse, normalize, dump.
@@ -219,7 +272,7 @@ fn ir_pass(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let mut g = match (input, sv) {
-        (None, Some(sv)) => match vyges_syn::synthesis::sv_elaborate(&sv, &libs) {
+        (None, Some(sv)) => match vyges_syn::synthesis::sv_elaborate(&sv, &libs, &Default::default()) {
             Ok(g) => g,
             Err(vyges_syn::elab::frontend::Failed::Reported) => {
                 println!("[ERROR SYN-0001] Elaboration failed.");
@@ -313,8 +366,17 @@ fn ir_pass(args: &[String]) -> ExitCode {
 fn synthesize(args: &[String]) -> ExitCode {
     let (mut out, mut lefs, mut rest, mut dont_use) = (None, Vec::new(), Vec::new(), Vec::new());
     let mut libs = vyges_syn::library::Libraries::default();
+    let mut naming = HierNaming::default();
     let mut i = 0;
     while i < args.len() {
+        match hier_naming_flag(args, &mut i, &mut naming) {
+            Some(Ok(())) => {
+                i += 1;
+                continue;
+            }
+            Some(Err(code)) => return code,
+            None => {}
+        }
         match args[i].as_str() {
             "--liberty" if rest.is_empty() && i + 1 < args.len() => {
                 if let Err(e) = libs.read(&args[i + 1]) {
@@ -366,16 +428,9 @@ fn synthesize(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let mut g = match vyges_syn::synthesis::sv_elaborate(&rest, &libs) {
+    let mut g = match vyges_syn::synthesis::sv_elaborate(&rest, &libs, &naming) {
         Ok(g) => g,
-        Err(vyges_syn::elab::frontend::Failed::Reported) => {
-            println!("[ERROR SYN-0001] Elaboration failed.");
-            return ExitCode::from(1);
-        }
-        Err(vyges_syn::elab::frontend::Failed::Error(code, msg)) => {
-            println!("[ERROR SYN-{code:04}] {msg}");
-            return ExitCode::from(1);
-        }
+        Err(e) => return elab_failed(e),
     };
     events::step("synthesize", &format!("elaborated {}", if g.name.is_empty() { "the design" } else { &g.name }));
     let mut abc = match vyges_abc_lib::Abc::start() {
@@ -593,8 +648,17 @@ fn refuse_why(why: &str) -> ExitCode {
 fn sv_elaborate(args: &[String]) -> ExitCode {
     let (mut raw, mut out, mut rest) = (false, None, Vec::new());
     let mut libs = vyges_syn::library::Libraries::default();
+    let mut naming = HierNaming::default();
     let mut i = 0;
     while i < args.len() {
+        match hier_naming_flag(args, &mut i, &mut naming) {
+            Some(Ok(())) => {
+                i += 1;
+                continue;
+            }
+            Some(Err(code)) => return code,
+            None => {}
+        }
         match args[i].as_str() {
             "--raw" if rest.is_empty() => raw = true,
             "--liberty" if rest.is_empty() && i + 1 < args.len() => {
@@ -618,9 +682,9 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let result = if raw {
-        vyges_syn::elab::frontend::elaborate(&rest, &libs.blackboxes())
+        vyges_syn::synthesis::elaborate(&rest, &libs, &naming)
     } else {
-        vyges_syn::synthesis::sv_elaborate(&rest, &libs)
+        vyges_syn::synthesis::sv_elaborate(&rest, &libs, &naming)
     };
     match result {
         Ok(g) => {
@@ -630,14 +694,7 @@ fn sv_elaborate(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(vyges_syn::elab::frontend::Failed::Reported) => {
-            println!("[ERROR SYN-0001] Elaboration failed.");
-            ExitCode::from(1)
-        }
-        Err(vyges_syn::elab::frontend::Failed::Error(code, msg)) => {
-            println!("[ERROR SYN-{code:04}] {msg}");
-            ExitCode::from(1)
-        }
+        Err(e) => elab_failed(e),
     }
 }
 

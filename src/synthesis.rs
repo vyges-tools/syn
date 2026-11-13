@@ -5,6 +5,7 @@ use vyges_abc_lib::Abc;
 
 use crate::elab::backend::ElabError;
 use crate::elab::frontend::{self, Failed};
+use crate::elab::hierarchy::{self, HierNaming};
 use crate::flow::abc::abc_roundtrip;
 use crate::flow::bitblast::bitblast;
 use crate::flow::combinational_mapper::map_combinationals;
@@ -19,14 +20,30 @@ use crate::library::Libraries;
 /// `sv_elaborate`: elaborate, then clean the graph up — names tentative, normalize, library cells
 /// imported, normalize, constants folded, normalize. The libraries' cells are blackbox modules
 /// the design may instantiate.
-pub fn sv_elaborate(args: &[String], libs: &Libraries) -> Result<Graph, Failed> {
-    let mut g = frontend::elaborate(args, &libs.blackboxes())?;
+pub fn sv_elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> Result<Graph, Failed> {
+    let mut g = elaborate(args, libs, naming)?;
     g.make_names_tentative();
     g.normalize();
     import_targets(&mut g, libs).map_err(|e| Failed::Error(e.code, e.message))?;
     g.normalize();
     constant_fold(&mut g);
     g.normalize();
+    Ok(g)
+}
+
+/// The frontend's graph, as built, with its names joined at module-instance boundaries as `naming`
+/// asks (flatten's separator, kept modules); the default leaves them as the frontend made them.
+pub fn elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> Result<Graph, Failed> {
+    let mut g = frontend::elaborate(args, &libs.blackboxes())?;
+    if !naming.is_default() {
+        // NOT in the reference `syn` (flat, `.` only): names as the Yosys reference flow's flatten.
+        let b = hierarchy::instance_boundaries(args).map_err(|e| Failed::Error(74, format!("module boundaries: {e}")))?;
+        let unknown = hierarchy::unknown_keep_modules(&b, naming);
+        if !unknown.is_empty() {
+            return Err(Failed::Error(73, format!("--keep-module: no module {} in the design", unknown.join(", "))));
+        }
+        hierarchy::flatten_names(&mut g, &b, naming);
+    }
     Ok(g)
 }
 

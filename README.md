@@ -16,8 +16,8 @@ Synthesis inside the suite, on the same AIG core as restructuring and formal, so
 
 ```
 vyges physical syn synthesize --liberty LIB... --lef TECH.lef --lef CELLS.lef -o OUT.v \
-    -- top.sv [--top NAME] [other slang arguments]
-vyges physical syn sv-elaborate [--raw] [--liberty LIB]... -o OUT.ir <slang arguments...>
+    [--hier-separator SEP] [--keep-module NAME]... -- top.sv [--top NAME] [other slang arguments]
+vyges physical syn sv-elaborate [--raw] [--liberty LIB]... [--hier-separator SEP] [--keep-module NAME]... -o OUT.ir <slang arguments...>
 vyges physical syn sv-ranges -o OUT.json <slang arguments...>
 vyges physical syn ir-pass [--liberty LIB]... <in.ir> -o OUT.ir PASS...
 vyges physical syn ir-normalize <in.ir> -o OUT.ir
@@ -25,6 +25,11 @@ vyges physical syn acd-resynth --liberty LIB... --sdc SDC [--apply] [-o OUT.odb]
 vyges physical syn run <job>
 vyges physical syn --describe
 ```
+
+The netlist is flat. Names from the design join a module-instance boundary with `.` by default;
+`--hier-separator /` joins them as Yosys `flatten -separator /` does (generate blocks keep `.`), and
+an instance of a `--keep-module` definition is joined with `/`, as a flow that keeps that module and
+then reads its netlist flat names it. Instance names are `u<N>` either way.
 
 ## Events
 
