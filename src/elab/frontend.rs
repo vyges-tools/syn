@@ -54,7 +54,8 @@ fn binary(op: fe::BinaryOp) -> BinaryOp {
         F::LogicalShiftRight => BinaryOp::LogicalShiftRight,
         F::ArithmeticShiftLeft => BinaryOp::ArithmeticShiftLeft,
         F::ArithmeticShiftRight => BinaryOp::ArithmeticShiftRight,
-        F::WildcardEquality | F::WildcardInequality | F::LogicalImplication | F::LogicalEquivalence | F::Power => {
+        F::Power => BinaryOp::Power,
+        F::WildcardEquality | F::WildcardInequality | F::LogicalImplication | F::LogicalEquivalence => {
             BinaryOp::Other
         }
     }

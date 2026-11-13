@@ -54,6 +54,8 @@ pub enum BinaryOp {
     LogicalShiftRight,
     ArithmeticShiftLeft,
     ArithmeticShiftRight,
+    /// `**`: only the forms the reference maps (see `power`).
+    Power,
     Other,
 }
 
@@ -371,12 +373,85 @@ impl Backend {
                 };
                 self.add(Kind::Shift(s, a, b, 1))
             }
+            Power => return self.power(a, b, a_signed, b_signed, y),
             Other => return err(71, "Unsupported binary operator"),
         };
         Ok(r)
     }
 
     /// Both operands constant: the folded result, or none for an operator not folded here.
+    /// `a ** b` as the reference maps it. sv-elab folds a constant expression before it reaches a
+    /// backend (`EvalContext::operator()`), and hands any other `**` on as a `$pow` cell; Yosys
+    /// (`opt_expr`, 0.68) rewrites a `$pow` whose base is a constant power of two 2^k, unsigned or
+    /// positive, and whose exponent is unsigned, as `1 << (k * b)` (k = 1: `1 << b`), and its techmap
+    /// refuses every other `$pow` (`_90_pow`: `_TECHMAP_FAIL_`). Refused here the same way.
+    fn power(&mut self, a: Bundle, b: Bundle, a_signed: bool, b_signed: bool, y: u64) -> R {
+        if !is_const(&a) || b_signed {
+            return err(71, "Unsupported power: only a constant power-of-two base with an unsigned exponent is mapped (as the reference maps it)");
+        }
+        let c = to_const(&a);
+        let ones: Vec<usize> = c.iter().enumerate().filter(|(_, &t)| t == Trit::One).map(|(i, _)| i).collect();
+        let onehot = ones.len() == 1 && c.iter().all(|&t| t != Trit::Undef);
+        if !onehot || (a_signed && ones[0] == c.len() - 1) {
+            return err(71, "Unsupported power: only a constant power-of-two base with an unsigned exponent is mapped (as the reference maps it)");
+        }
+        let k = ones[0];
+        let amount = if k == 1 {
+            b
+        } else {
+            // `$mul` of the constant k (the base's width) and b, kept to the result width.
+            let mut kc: Bundle = (0..c.len()).map(|i| if i < usize::BITS as usize && (k >> i) & 1 == 1 { Net::ONE } else { Net::ZERO }).collect();
+            let mut bb = b;
+            let w = (kc.len() as u64).max(bb.len() as u64).max(y);
+            widen(&mut kc, false, w);
+            widen(&mut bb, false, w);
+            let mut r = self.bin(BinOp::Mul, kc, bb);
+            r.truncate(y as usize);
+            r
+        };
+        Ok(self.add(Kind::Shift(ShiftOp::Shl, zero_extend(&[Net::ONE], y), amount, 1)))
+    }
+
+    /// A constant `a ** b`, as the reference's frontend folds it (slang `SVInt::pow`, IEEE 1800
+    /// table 11-4). `a` is context-determined (extended to the result width `y`, sign by its own
+    /// signedness), `b` self-determined. In order: any unknown bit gives all-x; `0**0` is 1, `0**-b`
+    /// all-x, `0**b` 0; `a**0` and `1**b` are 1; a signed `-1` gives -1 for an odd `b`, else 1; any
+    /// other `a` to a negative `b` is 0; otherwise `a^b` kept to `y` bits (a negative `a` included:
+    /// slang negates, raises and re-negates, which is the same two's-complement product).
+    fn fold_power(ac: &[Trit], bc: &[Trit], a_signed: bool, b_signed: bool, y: u64) -> Option<Vec<Trit>> {
+        let yu = y as usize;
+        let fill = |t: Trit| vec![t; yu];
+        let int = |v: u64| extend_const(&[if v == 1 { Trit::One } else { Trit::Zero }], false, y);
+        if ac.iter().chain(bc).any(|&t| t == Trit::Undef) {
+            return Some(fill(Trit::Undef));
+        }
+        let a = extend_const(ac, a_signed, y);
+        let zero = |c: &[Trit]| c.iter().all(|&t| t == Trit::Zero);
+        let b_neg = b_signed && bc.last() == Some(&Trit::One);
+        let b_odd = bc.first() == Some(&Trit::One);
+        if zero(&a) {
+            return Some(if zero(bc) { int(1) } else if b_neg { fill(Trit::Undef) } else { int(0) });
+        }
+        if zero(bc) || a.iter().skip(1).all(|&t| t == Trit::Zero) {
+            return Some(int(1));
+        }
+        if a_signed && a.iter().all(|&t| t == Trit::One) {
+            return Some(if b_odd { fill(Trit::One) } else { int(1) });
+        }
+        if b_neg {
+            return Some(int(0));
+        }
+        let mut r = int(1);
+        // Square-and-multiply over b's bits, most significant first; every product kept to y bits.
+        for &t in bc.iter().rev() {
+            r = k::mul(&r, &r)[..yu].to_vec();
+            if t == Trit::One {
+                r = k::mul(&r, &a)[..yu].to_vec();
+            }
+        }
+        Some(r)
+    }
+
     fn fold(op: BinaryOp, ac: &[Trit], bc: &[Trit], a_signed: bool, b_signed: bool, y: u64) -> Option<Vec<Trit>> {
         use BinaryOp::*;
         let ext = extend_const;
@@ -404,6 +479,7 @@ impl Backend {
             LogicalShiftRight => k::ushr(&ext(ac, a_signed, y), bc, 1),
             ArithmeticShiftRight if a_signed => k::sshr(&ext(ac, a_signed, y), bc, 1),
             ArithmeticShiftRight => k::ushr(&ext(ac, a_signed, y), bc, 1),
+            Power => return Self::fold_power(ac, bc, a_signed, b_signed, y),
             _ => return None,
         })
     }
@@ -566,6 +642,61 @@ fn as_net(v: &[Net]) -> Net {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn konst(v: u64, w: usize) -> Bundle {
+        (0..w).map(|i| if (v >> i) & 1 == 1 { Net::ONE } else { Net::ZERO }).collect()
+    }
+    fn ops(b: &Backend, op: &str) -> usize {
+        b.graph.dump().lines().filter(|l| l.contains(&format!(" {op} "))).count()
+    }
+
+    // Rule (sv-elab `EvalContext::operator()` + Yosys `opt_expr`, 0.68, as ORFS runs them): sv-elab
+    // folds a constant `**` itself and hands any other on as `$pow`; Yosys rewrites a `$pow` whose base
+    // is a constant 2^k (unsigned, or signed and positive) and whose exponent is unsigned as
+    // `1 << (k * b)` (k = 1: `1 << b`); its techmap refuses every other `$pow` (`_TECHMAP_FAIL_`).
+    // Witness: CoralNPU's FPU, `2**fpnew_pkg::exp_bits(dst_fmt_q2)` with a run-time format.
+    #[test]
+    fn power_maps_a_power_of_two_base_as_a_shift_and_refuses_the_rest() {
+        use BinaryOp::Power;
+        // Constant operands fold: 2**5, 3**4, and 3**5 kept to 8 bits.
+        let mut b = Backend::new();
+        assert_eq!(b.biop(Power, konst(2, 32), konst(5, 32), true, false, 32).unwrap(), konst(32, 32));
+        assert_eq!(b.biop(Power, konst(3, 32), konst(4, 32), true, false, 8).unwrap(), konst(81, 8));
+        assert_eq!(b.biop(Power, konst(3, 32), konst(5, 32), true, false, 8).unwrap(), konst(243, 8));
+        // The rest of the constant table (slang `SVInt::pow`): a signed negative base, a signed
+        // negative exponent, 0 and -1 and 1 as bases, and an unknown bit.
+        let neg = |v: i64, w: usize| konst(v as u64 & ((1u64 << w) - 1), w);
+        assert_eq!(b.biop(Power, neg(-2, 8), konst(3, 8), true, false, 8).unwrap(), neg(-8, 8));
+        assert_eq!(b.biop(Power, neg(-3, 8), konst(2, 8), true, false, 8).unwrap(), konst(9, 8));
+        assert_eq!(b.biop(Power, konst(2, 8), neg(-1, 8), false, true, 8).unwrap(), konst(0, 8));
+        assert_eq!(b.biop(Power, konst(1, 8), neg(-3, 8), false, true, 8).unwrap(), konst(1, 8));
+        assert_eq!(b.biop(Power, neg(-1, 8), neg(-3, 8), true, true, 8).unwrap(), neg(-1, 8));
+        assert_eq!(b.biop(Power, neg(-1, 8), konst(4, 8), true, false, 8).unwrap(), konst(1, 8));
+        assert_eq!(b.biop(Power, konst(0, 8), konst(0, 8), false, false, 8).unwrap(), konst(1, 8));
+        assert_eq!(b.biop(Power, konst(0, 8), konst(3, 8), false, false, 8).unwrap(), konst(0, 8));
+        assert_eq!(b.biop(Power, konst(0, 8), neg(-3, 8), false, true, 8).unwrap(), vec![Net::UNDEF; 8]);
+        // Unsigned 0xff is 255, not -1: 255**3 kept to 8 bits.
+        assert_eq!(b.biop(Power, konst(255, 8), konst(3, 8), false, false, 8).unwrap(), konst(255, 8));
+        // A signed literal 2 (positive) with a run-time unsigned exponent: one shift of 1, no multiply.
+        let mut b = Backend::new();
+        let e = b.add_placeholder_signal(4, "", false).unwrap();
+        let r = b.biop(Power, konst(2, 32), e.clone(), true, false, 16).unwrap();
+        assert_eq!(r.len(), 16);
+        assert_eq!((ops(&b, "shl"), ops(&b, "mul")), (1, 0));
+        // Base 4 = 2^2: a multiply by 2 and a shift.
+        let mut b = Backend::new();
+        let e = b.add_placeholder_signal(4, "", false).unwrap();
+        b.biop(Power, konst(4, 32), e, false, false, 16).unwrap();
+        assert_eq!((ops(&b, "shl"), ops(&b, "mul")), (1, 1));
+        // Refused, as the reference's techmap refuses them: base 3, a run-time base, a signed
+        // exponent, and a signed base whose one set bit is its sign bit (negative).
+        let mut b = Backend::new();
+        let e = b.add_placeholder_signal(4, "", false).unwrap();
+        assert_eq!(b.biop(Power, konst(3, 32), e.clone(), false, false, 16).unwrap_err().code, 71);
+        assert_eq!(b.biop(Power, e.clone(), konst(2, 32), false, false, 16).unwrap_err().code, 71);
+        assert_eq!(b.biop(Power, konst(2, 32), e.clone(), true, true, 16).unwrap_err().code, 71);
+        assert_eq!(b.biop(Power, konst(8, 4), e, true, false, 16).unwrap_err().code, 71);
+    }
 
     #[test]
     fn bwmux_is_one_mux_per_run_of_a_shared_select() {
