@@ -745,6 +745,14 @@ fn code_of(c: ExitCode) -> u8 {
 /// The trail's flags: before the command only, since a command's arguments run on into slang's.
 const TRAIL_FLAGS: &[&str] = &["-q", "--quiet", "-v", "--verbose"];
 
+/// The binary allocates through mimalloc, as the reference allocates through the tcmalloc its
+/// Bazel build links (`malloc = @tcmalloc`); see Cargo.toml for the pin.
+/// Not when this file is built into the library as `cli_main` (feature `suite`): the suite
+/// binary that links the library defines the allocator itself.
+#[cfg(all(feature = "mimalloc", not(feature = "suite")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub fn main() -> ExitCode {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let lead = all.iter().take_while(|a| TRAIL_FLAGS.contains(&a.as_str())).count();
