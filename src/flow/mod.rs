@@ -9,6 +9,8 @@ pub mod combinational_mapper;
 pub mod constant_fold;
 pub mod export;
 pub mod import;
+pub mod latch_inference;
+pub mod latch_rule;
 pub mod liveness;
 pub mod npn;
 pub mod opt_gatefusion;

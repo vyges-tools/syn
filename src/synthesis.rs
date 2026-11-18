@@ -11,15 +11,16 @@ use crate::flow::bitblast::bitblast;
 use crate::flow::combinational_mapper::map_combinationals;
 use crate::flow::constant_fold::constant_fold;
 use crate::flow::import::import_targets;
+use crate::flow::latch_inference::infer_latches;
 use crate::flow::liveness::liveness_opt;
 use crate::flow::opt_gatefusion::gate_fusion_opt;
 use crate::flow::sequential_mapper::map_sequentials;
 use crate::ir::Graph;
 use crate::library::Libraries;
 
-/// `sv_elaborate`: elaborate, then clean the graph up — names tentative, normalize, library cells
-/// imported, normalize, constants folded, normalize. The libraries' cells are blackbox modules
-/// the design may instantiate.
+/// `sv_elaborate`: elaborate, clean the graph up — names tentative, normalize, library cells
+/// imported, normalize, constants folded, normalize — then infer latches. The libraries' cells
+/// are blackbox modules the design may instantiate.
 pub fn sv_elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> Result<Graph, Failed> {
     let mut g = elaborate(args, libs, naming)?;
     g.make_names_tentative();
@@ -28,6 +29,17 @@ pub fn sv_elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> R
     g.normalize();
     constant_fold(&mut g);
     g.normalize();
+    // DIVERGENCE D2: the reference leaves a latch as the frontend's feedback mux and rejects the
+    // loop here (`check_combinational_loops`, after `opt`); the Yosys reference flow makes it a
+    // latch (`proc_dlatch`), as here, on the loops that survive optimization.
+    let latches = infer_latches(&mut g, libs);
+    if latches.mapped > 0 {
+        println!("[INFO SYN-0082] inferred {} latch bit(s) as library latches (not in the reference flow)", latches.mapped);
+        g.normalize();
+    }
+    if latches.unmapped > 0 {
+        println!("[WARNING SYN-0083] {} latch bit(s) stay combinational loops: no plain latch cell in the libraries", latches.unmapped);
+    }
     Ok(g)
 }
 
