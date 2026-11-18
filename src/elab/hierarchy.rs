@@ -162,7 +162,7 @@ impl<'a> Walk<'a> {
 }
 
 /// `[l:r]`'s lower bound.
-fn range_lower(r: &str) -> Option<i64> {
+pub(crate) fn range_lower(r: &str) -> Option<i64> {
     let (l, rt) = r.strip_prefix('[')?.strip_suffix(']')?.split_once(':')?;
     Some(l.trim().parse::<i64>().ok()?.min(rt.trim().parse().ok()?))
 }

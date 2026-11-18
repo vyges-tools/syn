@@ -24,13 +24,31 @@ const LIB: &str = r#"library (latches) {
     area : 1.0;
     pin (D) { direction : input; }
     pin (E) { direction : input; }
-    pin (Q) { direction : output; function : "IQ"; }
+    pin (Q) {
+      direction : output; function : "IQ";
+      timing () { related_pin : "D"; cell_rise (scalar) { values ("0.1"); } cell_fall (scalar) { values ("0.1"); } }
+    }
     latch (IQ, IQN) { enable : "!E"; data_in : "D"; }
+  }
+  cell (ARC1) {
+    area : 2.0;
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output;
+      timing () { related_pin : "A"; cell_rise (scalar) { values ("0.1"); } cell_fall (scalar) { values ("0.1"); } }
+    }
+  }
+  cell (AN2) {
+    area : 2.0;
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A & B"; }
   }
 }
 "#;
 
-/// CoralNPU's `ClockGate` (its generic branch), two more latch forms, and a form that is no latch.
+/// CoralNPU's `ClockGate` (its generic branch), more latch forms, forms that are no latch, and a
+/// plain combinational loop.
 const SRC: &str = "\
 module cg(input clk_i, input enable, input te, output clk_o);
   logic en_latch;
@@ -67,6 +85,25 @@ module blockvar(input [1:0] sel, input [3:0] lt, output logic [3:0] elt);
       default: elt = '0;
     endcase
   end
+endmodule
+module combinc(input g, input d, output logic q);
+  always_comb begin
+    if (g) q = d;
+  end
+endmodule
+module selfassign(input s, input d, output q);
+  assign q = s ? d : q;
+endmodule
+module starinc(input g, input d, output reg q);
+  always @(*) begin
+    if (g) q = d;
+  end
+endmodule
+module andor(input a, b, c, output y);
+  wire p, q;
+  assign p = a & q;
+  assign q = p | b;
+  assign y = q ^ c;
 endmodule
 ";
 
@@ -213,4 +250,72 @@ fn latch_output_carries_the_variable_name() {
         })
         .collect();
     assert_eq!(named, q, "the name en_latch is on the latch output\n{}", g.dump());
+}
+
+/// The loop check (the reference's `check_combinational_loops`) on the elaborated design.
+fn loop_check(top: &str) -> Result<(), String> {
+    let mut g = elaborate(top, true);
+    vyges_syn::flow::loop_check::check_combinational_loops(&mut g)
+}
+
+/// The reference rejects a combinational loop: one SYN-0080 for `p = a & q; q = p | b`.
+#[test]
+fn a_combinational_loop_is_rejected() {
+    let e = loop_check("andor").expect_err("a loop is rejected");
+    assert!(e.starts_with("[ERROR SYN-0080] Design contains 1 combinational loop(s)."), "{e}");
+}
+
+/// The ClockGate's latch passes the loop check: a latch cell's output does not depend on its data
+/// input combinationally (its D-to-Q arc is the latch's, not a combinational one), so the clock
+/// gate's AND does not close a loop through it.
+#[test]
+fn the_clock_gate_latch_passes_the_loop_check() {
+    assert_eq!(loop_check("cg"), Ok(()));
+    assert_eq!(loop_check("hi"), Ok(()));
+    assert_eq!(loop_check("nest"), Ok(()));
+}
+
+/// Yosys's slang frontend makes no latch for an `always_comb` (only for `always_latch` and an
+/// edgeless `always`), and the reference rejects the loop: `always_comb if (g) q = d;` stays a
+/// loop, and the check rejects it (reference: SYN-0079 on `q`, then SYN-0080).
+#[test]
+fn an_incomplete_always_comb_is_no_latch_and_is_rejected() {
+    let g = elaborate("combinc", true);
+    assert!(latches(&g).is_empty(), "{:?}", latches(&g));
+    let e = loop_check("combinc").expect_err("the loop is rejected");
+    assert!(e.starts_with("[ERROR SYN-0080]"), "{e}");
+}
+
+/// `assign q = s ? d : q;` is no process: the reference rejects the loop, and so do we.
+#[test]
+fn a_continuous_assignment_that_reads_itself_is_rejected() {
+    let g = elaborate("selfassign", true);
+    assert!(latches(&g).is_empty(), "{:?}", latches(&g));
+    let e = loop_check("selfassign").expect_err("the loop is rejected");
+    assert!(e.starts_with("[ERROR SYN-0080]"), "{e}");
+}
+
+/// `always @(*) if (g) q = d;`: Yosys's frontend makes it a latch (an edgeless `always`), as
+/// here; the reference rejects it (DIVERGENCE D2).
+#[test]
+fn an_incomplete_always_star_is_a_latch() {
+    let g = elaborate("starinc", true);
+    check(&g, &["g", "d"], |i| i["g"], |i| i["d"]);
+    assert_eq!(loop_check("starinc"), Ok(()));
+}
+
+/// The reference's `computeCellDeps`: an output depends on the inputs its function names and on
+/// those with a combinational arc to it; a latch's D-to-Q arc is not one.
+#[test]
+fn cell_dependencies_follow_function_and_combinational_arcs() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("latch_inference");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("deps.lib");
+    std::fs::write(&lib, LIB).unwrap();
+    let mut libs = Libraries::default();
+    libs.read(&lib.to_string_lossy()).unwrap();
+    let deps = |c: &str| libs.find_cell(c).unwrap().comb_deps.clone();
+    assert_eq!(deps("AN2"), vec![vec![0, 1]], "both inputs, by the function");
+    assert_eq!(deps("ARC1"), vec![vec![0]], "the input, by its arc alone");
+    assert_eq!(deps("LATL"), vec![Vec::<u32>::new()], "a latch's D-to-Q arc is no combinational dependency");
 }

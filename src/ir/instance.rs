@@ -175,6 +175,12 @@ pub struct LibCell {
     pub dont_use: bool,
     /// Its one `ff` / `latch` group, when it has exactly one (and no bank or `statetable`).
     pub seq: Option<LibSeq>,
+    /// Per output bit of a `Target` (its layout: ports in library order, power pins skipped, a
+    /// bidirect port both an input and an output), the input bits it depends on combinationally:
+    /// those its `function` or `three_state` names, and those with a combinational or three-state
+    /// arc to it (the reference's `computeCellDeps`). A latch's D-to-Q, a register's clock-to-Q
+    /// and an async set or clear are not combinational.
+    pub comb_deps: Vec<Vec<u32>>,
 }
 
 #[derive(Clone, Debug)]

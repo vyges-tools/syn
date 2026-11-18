@@ -20,7 +20,9 @@ suite = []
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
-serde_json = "1"
+# `unbounded_depth`: slang's design JSON nests deeper than the default limit on real designs
+# (long expression chains); `elab::procedures` parses it on a thread with a large stack.
+serde_json = { version = "1", features = ["unbounded_depth"] }
 # The causal trail. ⚠️ `default-features = false` as in the other engines: the trail is
 # structured output on stderr, not a logging framework this engine gets to choose.
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }

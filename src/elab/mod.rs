@@ -4,4 +4,5 @@
 pub mod backend;
 pub mod frontend;
 pub mod hierarchy;
+pub mod procedures;
 pub mod ranges;

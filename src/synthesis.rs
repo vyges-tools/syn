@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The commands, each nothing but the sequence of stages it runs, in the reference's order.
 
+use std::collections::BTreeSet;
+
 use vyges_abc_lib::Abc;
 
 use crate::elab::backend::ElabError;
 use crate::elab::frontend::{self, Failed};
 use crate::elab::hierarchy::{self, HierNaming};
+use crate::elab::procedures;
 use crate::flow::abc::abc_roundtrip;
 use crate::flow::bitblast::bitblast;
 use crate::flow::combinational_mapper::map_combinationals;
@@ -13,6 +16,7 @@ use crate::flow::constant_fold::constant_fold;
 use crate::flow::import::import_targets;
 use crate::flow::latch_inference::infer_latches;
 use crate::flow::liveness::liveness_opt;
+use crate::flow::loop_check::check_combinational_loops;
 use crate::flow::opt_gatefusion::gate_fusion_opt;
 use crate::flow::sequential_mapper::map_sequentials;
 use crate::ir::Graph;
@@ -32,7 +36,7 @@ pub fn sv_elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> R
     // DIVERGENCE D2: the reference leaves a latch as the frontend's feedback mux and rejects the
     // loop here (`check_combinational_loops`, after `opt`); the Yosys reference flow makes it a
     // latch (`proc_dlatch`), as here, on the loops that survive optimization.
-    let latches = infer_latches(&mut g, libs);
+    let latches = infer_latches(&mut g, libs, || latch_variables(args, naming));
     if latches.mapped > 0 {
         println!("[INFO SYN-0082] inferred {} latch bit(s) as library latches (not in the reference flow)", latches.mapped);
         g.normalize();
@@ -41,6 +45,26 @@ pub fn sv_elaborate(args: &[String], libs: &Libraries, naming: &HierNaming) -> R
         println!("[WARNING SYN-0083] {} latch bit(s) stay combinational loops: no plain latch cell in the libraries", latches.unmapped);
     }
     Ok(g)
+}
+
+/// The variables of `always_latch` and edgeless `always` blocks, named as the graph names them
+/// (`naming` joins module-instance boundaries). None when slang cannot say (a warning): every
+/// such loop then stays a loop.
+fn latch_variables(args: &[String], naming: &HierNaming) -> BTreeSet<String> {
+    let vars = match procedures::latch_variables(args) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[WARNING SYN-0084] latch inference: cannot read the processes ({e}); no latch inferred");
+            return BTreeSet::new();
+        }
+    };
+    if naming.is_default() {
+        return vars;
+    }
+    let Ok(b) = hierarchy::instance_boundaries(args) else { return BTreeSet::new() };
+    let sep = naming.separator.as_deref().unwrap_or(".");
+    let kept: BTreeSet<&str> = naming.keep_modules.iter().map(String::as_str).collect();
+    vars.iter().map(|v| hierarchy::join_boundaries(v, &b, sep, &kept)).collect()
 }
 
 /// The frontend's graph, as built, with its names joined at module-instance boundaries as `naming`
@@ -70,9 +94,9 @@ fn reported(e: ElabError) -> String {
 }
 
 /// `synthesize` up to the export: bitblast all but arithmetic, liveness, the fraiging round trip,
-/// bitblast arithmetic too, fold constants, the rewriting round trip, map the registers, map the
-/// logic, fuse gates, print the counts. Names may be lost at any fanout. An error comes back as
-/// the line the run reports.
+/// bitblast arithmetic too, fold constants, reject combinational loops, the rewriting round trip,
+/// map the registers, map the logic, fuse gates, print the counts. Names may be lost at any
+/// fanout. An error comes back as the line the run reports.
 pub fn synthesize(g: &mut Graph, libs: &Libraries, abc: &mut Abc) -> Result<(), String> {
     bitblast(g, false);
     let (regs, combs) = liveness_opt(g, false);
@@ -80,6 +104,7 @@ pub fn synthesize(g: &mut Graph, libs: &Libraries, abc: &mut Abc) -> Result<(), 
     abc_roundtrip(g, abc, ABC_FRAIG, -1)?;
     bitblast(g, true);
     constant_fold(g);
+    check_combinational_loops(g)?;
     // DIVERGENCE D1: the reference leaves division and modulo unmapped (dropped at export).
     let divmods = crate::flow::bitblast::bitblast_divmod(g);
     if divmods > 0 {

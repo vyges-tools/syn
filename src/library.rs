@@ -21,7 +21,7 @@ pub struct Libraries {
 }
 
 fn lib_cell(c: &vyges_loom::liberty::Cell) -> LibCell {
-    let ports = c
+    let ports: Vec<LibPort> = c
         .ports
         .iter()
         .map(|p| LibPort {
@@ -50,6 +50,7 @@ fn lib_cell(c: &vyges_loom::liberty::Cell) -> LibCell {
         clear: s.attrs.get("clear").map(unquote),
         preset: s.attrs.get("preset").map(unquote),
     });
+    let comb_deps = comb_deps(c, &ports, seq.as_ref());
     LibCell {
         name: c.name.clone(),
         area: c.area as f32,
@@ -58,7 +59,57 @@ fn lib_cell(c: &vyges_loom::liberty::Cell) -> LibCell {
         ports,
         dont_use: c.dont_use,
         seq,
+        comb_deps,
     }
+}
+
+/// One bit of a port: its name, and the name of that bit (a bus bit is `bus[index]`, counting
+/// from the bus's first index toward its last).
+fn port_bits(p: &LibPort) -> Vec<String> {
+    match p.bus {
+        Some((from, to)) => (0..p.size as i64).map(|j| format!("{}[{}]", p.name, if from <= to { from + j } else { from - j })).collect(),
+        None => vec![p.name.clone()],
+    }
+}
+
+/// The reference's `computeCellDeps`: for each output bit of the cell's `Target` layout, the
+/// input bits it depends on combinationally (see [`LibCell::comb_deps`]). The library reader has
+/// already turned a sequential cell's clock arc into an edge arc and dropped its set and clear
+/// arcs; a latch's D-to-Q arc is still undistinguished there, so it is left out here by the
+/// latch's `data_in`.
+fn comb_deps(c: &vyges_loom::liberty::Cell, ports: &[LibPort], seq: Option<&LibSeq>) -> Vec<Vec<u32>> {
+    use vyges_loom::liberty_func::Func;
+    let (mut ins, mut outs): (Vec<(String, String)>, Vec<String>) = (Vec::new(), Vec::new());
+    for p in ports.iter().filter(|p| !p.pwr_gnd) {
+        let bits = port_bits(p);
+        if matches!(p.direction, LibDirection::Input | LibDirection::Bidirect) {
+            ins.extend(bits.iter().map(|b| (p.name.clone(), b.clone())));
+        }
+        if matches!(p.direction, LibDirection::Output | LibDirection::Bidirect) {
+            outs.extend(bits);
+        }
+    }
+    let ports_of = |e: Option<&str>| -> Vec<String> {
+        e.and_then(|f| Func::parse_in(f, |_| true)).map(|f| f.ports().into_iter().map(str::to_string).collect()).unwrap_or_default()
+    };
+    let latch_data: Vec<String> = match seq {
+        Some(s) if s.latch => ports_of(s.next_state.as_deref()),
+        _ => Vec::new(),
+    };
+    outs.iter()
+        .map(|out| {
+            let Some(pin) = c.pins.get(out) else { return Vec::new() };
+            let named: Vec<String> = ports_of(pin.function.as_deref()).into_iter().chain(ports_of(pin.three_state())).collect();
+            let arcs: Vec<&str> = pin
+                .arcs
+                .iter()
+                .filter(|a| a.clk_edge.is_none() && !latch_data.contains(&a.related_pin))
+                .map(|a| a.related_pin.as_str())
+                .collect();
+            let depends = |(port, bit): &(String, String)| named.iter().any(|n| n == bit) || arcs.iter().any(|r| r == bit || *r == port.as_str());
+            ins.iter().enumerate().filter(|(_, b)| depends(b)).map(|(i, _)| i as u32).collect()
+        })
+        .collect()
 }
 
 /// Every library, in read order, and in each its cells by name: the order the reference walks them.

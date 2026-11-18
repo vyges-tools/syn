@@ -15,6 +15,10 @@
 //! the graph as the frontend built it (as Yosys runs `proc`), it also took structural loops that
 //! optimization removes, such as a static function variable read back before it is written (2,802
 //! bits on CoralNPU, 2026-11-17, where the base and the reference have two latches).
+//! Only a loop on a variable written by an `always_latch` or an edgeless `always` block is a latch
+//! (`elab::procedures`, the Yosys frontend's rule): an `always_comb` left incomplete, or a
+//! continuous assignment that reads its own result, stays a loop, which the loop check rejects as
+//! the reference does.
 //! For each loop breaker whose loop is a mux tree, `latch_rule::proc_dlatch` gives the hold
 //! condition and the data input (the breaker's output is the feedback), and the bit becomes a
 //! library latch cell: enable active low on the
@@ -22,6 +26,7 @@
 //! the hold's own input when the hold is a complement (Yosys `opt` folds the inverter into the
 //! enable polarity the same way).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::flow::latch_rule::{self, LatchGraph, Node};
@@ -276,11 +281,16 @@ pub struct LatchCount {
     pub mapped: usize,
     /// Bits a mux tree reads back that stay loops: the libraries have no plain latch.
     pub unmapped: usize,
+    /// Loops left as loops because their variable is not written by an `always_latch` or an
+    /// edgeless `always` block.
+    pub not_latch_like: usize,
 }
 
-/// Every loop breaker whose loop is a mux tree becomes a library latch (see the module note).
-/// On a normalized graph; normalize it again after.
-pub fn infer_latches(g: &mut Graph, libs: &Libraries) -> LatchCount {
+/// Every loop breaker whose loop is a mux tree, on a variable `latch_variables` names, becomes a
+/// library latch (see the module note). `latch_variables` is asked only when there is such a
+/// loop: the variables of `always_latch` and edgeless `always` blocks (`elab::procedures`), by
+/// name. On a normalized graph; normalize it again after.
+pub fn infer_latches(g: &mut Graph, libs: &Libraries, latch_variables: impl FnOnce() -> BTreeSet<String>) -> LatchCount {
     let sccs = mux_sccs(g);
     let mut size = vec![0u32; sccs.len()];
     for &c in &sccs {
@@ -313,9 +323,24 @@ pub fn infer_latches(g: &mut Graph, libs: &Libraries) -> LatchCount {
     if candidates.is_empty() {
         return LatchCount::default();
     }
+    // the loop's variable: a name on the net it cuts or on one of its breakers
+    let latchy = latch_variables();
+    let mut named: BTreeSet<u32> = BTreeSet::new();
+    for id in g.instance_list() {
+        let Kind::Name(nm) = &g.inst(id).kind else { continue };
+        if latchy.contains(&nm.name) {
+            named.extend(nm.value.iter().map(|n| n.0));
+        }
+    }
     let (high, low) = latch_cells(libs);
     let mut count = LatchCount::default();
     for (rhs, ids, qs) in candidates {
+        // an `always_comb` left incomplete, or an assignment that reads itself, stays a loop: the
+        // check rejects it, as the reference does (Yosys: no latch for `always_comb` either)
+        if !named.contains(&rhs.0) && !qs.iter().any(|q| named.contains(&q.0)) {
+            count.not_latch_like += 1;
+            continue;
+        }
         let latch = {
             let mut v = View { g, needles: &qs, scc: &sccs };
             latch_rule::proc_dlatch(&mut v, rhs)
