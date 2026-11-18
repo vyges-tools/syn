@@ -277,8 +277,17 @@ pub fn map_sequentials(g: &mut Graph, libs: &Libraries) -> Result<(), ElabError>
             }
             let mut inputs = build_default_inputs(mt);
             inputs[mt.pins.clock_in as usize] = g.emit_control(mapped_clk);
-            inputs[mt.pins.data_in as usize] =
-                if mt.data_negated { g.add(Kind::Not(vec![dff.data[i]]))[0] } else { dff.data[i] };
+            inputs[mt.pins.data_in as usize] = match (mt.data_negated, dff.data[i]) {
+                (false, d) => d,
+                // DIVERGENCE (vyges-syn D4): a constant is complemented here, so the combinational
+                // mapper ties it off like any other constant input. The reference adds a `Not` of
+                // the constant, which the mapper treats as transparent and never maps: the export
+                // then leaves the D pin on an undriven net.
+                (true, Net::ONE) => Net::ZERO,
+                (true, Net::ZERO) => Net::ONE,
+                (true, Net::UNDEF) => Net::UNDEF,
+                (true, d) => g.add(Kind::Not(vec![d]))[0],
+            };
             if !dff.clear.is_always(false) {
                 let at = if arst_is_set { mt.pins.set_in } else { mt.pins.clear_in };
                 let n = g.emit_control(mapped_arst);
@@ -340,6 +349,63 @@ mod tests {
         libs.read(&path.to_string_lossy()).expect("the library parses");
         let _ = std::fs::remove_file(&path);
         libs
+    }
+
+    /// A constant data input on a cell with only the complemented output: the mapper complements
+    /// the data, and the constant must reach the cell's D pin as a tie cell after combinational
+    /// mapping, never as an undriven net. Rule (Yosys flow, as the ORFS netlist has it): a
+    /// register whose next state is the constant 1, mapped to a QN-only flop, has its D tied low
+    /// (here: TIEL); after the clear is released and a clock edge, Q is 1.
+    #[test]
+    fn a_constant_data_input_is_tied_through_the_complement() {
+        let lib = library(
+            "constd",
+            &[
+                "  cell (INV) { area : 1; pin (A) { direction : input; } pin (Y) { direction : output; function : \"!A\"; } }\n".into(),
+                "  cell (TIEH) { area : 1; pin (H) { direction : output; function : \"1\"; } }\n".into(),
+                "  cell (TIEL) { area : 1; pin (L) { direction : output; function : \"0\"; } }\n".into(),
+                // as ASAP7 DFFASRHQNx1: only QN, the state holding !D, clear and preset swapped
+                ff_next("DQNS", "CK", Some("!S"), Some("!R"), "IQ", "!D"),
+            ],
+        );
+        for (data, want) in [(Net::ONE, "TIEL"), (Net::ZERO, "TIEH")] {
+            let mut g = Graph::new();
+            let ck = g.add(Kind::Input("ck".into(), 1))[0];
+            let r = g.add(Kind::Input("r".into(), 1))[0];
+            let q = g.add(Kind::Dff(Box::new(Dff {
+                data: vec![data],
+                clock: ControlNet::with_polarity(ck, true),
+                clear: ControlNet::with_polarity(r, true),
+                reset: ControlNet::ZERO,
+                enable: ControlNet::ONE,
+                init_value: vec![Trit::Undef],
+                reset_value: vec![Trit::Undef],
+                clear_value: vec![Trit::Zero],
+            })));
+            g.add(Kind::Output("q".into(), q));
+            map_sequentials(&mut g, &lib).expect("the QN cell fits");
+            crate::flow::combinational_mapper::map_combinationals(&mut g, &lib).expect("inverter and ties");
+            let mut d_driver = None;
+            for id in g.instance_list() {
+                if let Kind::Target(cell, inputs) = &g.inst(id).kind {
+                    if cell.name == "DQNS" {
+                        let d = inputs[input_port_position(cell, "D") as usize];
+                        d_driver = Some(g.try_resolve(d).map(|(i, _)| match &g.inst(i).kind {
+                            Kind::Target(c, _) => c.name.clone(),
+                            k => k.keyword().to_string(),
+                        }));
+                    }
+                }
+            }
+            assert_eq!(d_driver, Some(Some(want.to_string())), "data {data:?}: the D pin's driver\n{}", g.dump());
+            let mut e = Eval::new(&g);
+            e.set_input("r", &[Trit::One]);
+            e.set_input("ck", &[Trit::Zero]);
+            e.set_input("r", &[Trit::Zero]);
+            e.clock("ck", &[Trit::One]);
+            let v = if data == Net::ONE { Trit::One } else { Trit::Zero };
+            assert_eq!(e.output("q"), [v], "data {data:?}: Q after one edge");
+        }
     }
 
     /// The mapped flip-flop behaves as the register on every input sequence: each register shape
