@@ -250,6 +250,87 @@ pub fn npn_semiclass_all_repr(mut m: Truth6, ninputs: usize, mut cb: impl FnMut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    /// `m` under `npn`, by the definition: input `i` complemented when `input_complement[i]` and
+    /// moved to `permutation[i]`, the output complemented when `output_complement`.
+    fn transform(m: Truth6, n: usize, npn: &Npn) -> Truth6 {
+        let mut out = 0;
+        for x in 0..1usize << n {
+            let mut y = 0;
+            for i in 0..n {
+                if ((x >> i) & 1 == 1) ^ npn.input_complement[i] {
+                    y |= 1 << npn.permutation[i];
+                }
+            }
+            if ((m >> x) & 1 == 1) ^ npn.output_complement {
+                out |= 1 << y;
+            }
+        }
+        out
+    }
+
+    /// Every transform of `n` inputs: each permutation, input complement and output complement.
+    fn transforms(n: usize) -> Vec<Npn> {
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut out = Vec::new();
+        loop {
+            for c in 0..1usize << n {
+                for oc in [false, true] {
+                    let mut t = Npn { output_complement: oc, ..Npn::default() };
+                    for i in 0..n {
+                        t.permutation[i] = perm[i] as i32;
+                        t.input_complement[i] = (c >> i) & 1 == 1;
+                    }
+                    out.push(t);
+                }
+            }
+            if !next_permutation(&mut perm) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// What the mapper relies on: the representative and its transform agree (applying the
+    /// transform to the function gives the representative), for `npn_semiclass` and for every
+    /// representative `npn_semiclass_all_repr` lists; and every function equivalent to `m` gets
+    /// from `npn_semiclass` one of the representatives `npn_semiclass_all_repr(m)` lists (the
+    /// library is indexed by the second, a cut looked up by the first). Every function of up to
+    /// `n` inputs, every transform.
+    fn npn_holds(n: usize) {
+        let ts = transforms(n);
+        for m in 0..1u64 << (1 << n) {
+            let mut npn = Npn::default();
+            let sc = npn_semiclass(m, n, &mut npn);
+            assert_eq!(transform(m, n, &npn), sc, "n={n} m={m:#x}: the transform does not give the representative");
+            let mut reprs = HashSet::new();
+            npn_semiclass_all_repr(m, n, |r, t| {
+                assert_eq!(transform(m, n, t), r, "n={n} m={m:#x}: a listed transform does not give its representative");
+                reprs.insert(r);
+            });
+            for t in &ts {
+                let g = transform(m, n, t);
+                let mut npn = Npn::default();
+                let r = npn_semiclass(g, n, &mut npn);
+                assert!(reprs.contains(&r), "n={n} m={m:#x}: its transform {g:#x} has representative {r:#x}, not listed");
+            }
+        }
+    }
+
+    #[test]
+    fn npn_representatives_are_consistent_up_to_three_inputs() {
+        for n in 1..=3 {
+            npn_holds(n);
+        }
+    }
+
+    /// The same at four inputs: 65,536 functions x 768 transforms (a box job; about a minute).
+    #[test]
+    #[ignore]
+    fn npn_representatives_are_consistent_at_four_inputs() {
+        npn_holds(4);
+    }
 
     // Rule: the representative of a 2-input AND (0b1000) is itself, untransformed; an OR (0b1110,
     // three rows 1) is complemented to a NOR (0b0001), then both inputs complemented so the 1 row

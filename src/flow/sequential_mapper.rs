@@ -300,3 +300,125 @@ pub fn map_sequentials(g: &mut Graph, libs: &Libraries) -> Result<(), ElabError>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::eval::{all_values, Eval};
+    use crate::ir::instance::Dff;
+    use crate::ir::ControlNet;
+
+    /// A flip-flop cell: clock `ck` ("CK" or "!CK"), an optional clear and preset expression, the
+    /// output `IQ` or `!IQ`; next state `D`.
+    fn ff(name: &str, ck: &str, clear: Option<&str>, preset: Option<&str>, out: &str) -> String {
+        ff_next(name, ck, clear, preset, out, "D")
+    }
+
+    /// As [`ff`] with the next state given: `!D` is how a library describes a flop with only a QN
+    /// pin (its state variable holds the complement, as ASAP7's `DFFASRHQNx1`).
+    fn ff_next(name: &str, ck: &str, clear: Option<&str>, preset: Option<&str>, out: &str, next: &str) -> String {
+        let mut pins = String::from("pin (CK) { direction : input; }\n    pin (D) { direction : input; }\n");
+        let mut group = format!("clocked_on : \"{ck}\"; next_state : \"{next}\";");
+        if let Some(c) = clear {
+            pins.push_str("    pin (R) { direction : input; }\n");
+            group.push_str(&format!(" clear : \"{c}\";"));
+        }
+        if let Some(p) = preset {
+            pins.push_str("    pin (S) { direction : input; }\n");
+            group.push_str(&format!(" preset : \"{p}\";"));
+        }
+        format!(
+            "  cell ({name}) {{\n    area : 1.0;\n    {pins}    pin (Q) {{ direction : output; function : \"{out}\"; }}\n    ff (IQ, IQN) {{ {group} }}\n  }}\n"
+        )
+    }
+
+    fn library(tag: &str, cells: &[String]) -> Libraries {
+        let text = format!("library (seq) {{\n{}}}\n", cells.concat());
+        let path = std::env::temp_dir().join(format!("vyges-syn-seqmap-{}-{tag}.lib", std::process::id()));
+        std::fs::write(&path, text).expect("the temporary directory is writable");
+        let mut libs = Libraries::default();
+        libs.read(&path.to_string_lossy()).expect("the library parses");
+        let _ = std::fs::remove_file(&path);
+        libs
+    }
+
+    /// The mapped flip-flop behaves as the register on every input sequence: each register shape
+    /// (clock edge rising or falling; no clear, or an active-high or active-low clear to zero or
+    /// to one) against libraries that offer only one polarity of each pin, or only a complemented
+    /// output (the mapper then complements the data and swaps clear and preset). From X, every
+    /// sequence of 4 steps of (clock, data, clear), compared where the register is defined.
+    #[test]
+    fn mapped_flip_flops_keep_every_polarity() {
+        let libs: Vec<(&str, Vec<String>)> = vec![
+            ("pos", vec![ff("DP", "CK", None, None, "IQ"), ff("DPR", "CK", Some("R"), None, "IQ"), ff("DPS", "CK", None, Some("S"), "IQ")]),
+            ("neg", vec![ff("DN", "!CK", None, None, "IQ"), ff("DNR", "!CK", Some("!R"), None, "IQ"), ff("DNS", "!CK", None, Some("!S"), "IQ")]),
+            ("qn", vec![ff("DQN", "CK", None, None, "!IQ"), ff("DQNR", "CK", Some("!R"), None, "!IQ"), ff("DQNS", "CK", None, Some("S"), "!IQ")]),
+            ("qn-neg", vec![ff("EQN", "!CK", Some("R"), None, "!IQ"), ff("EQNS", "!CK", None, Some("!S"), "!IQ"), ff("EN", "!CK", None, None, "!IQ")]),
+            (
+                "qn-state",
+                vec![
+                    ff_next("FQ", "CK", None, None, "IQ", "!D"),
+                    ff_next("FQRS", "CK", Some("!S"), Some("!R"), "IQ", "!D"),
+                ],
+            ),
+        ];
+        let steps = all_values(3, false);
+        for (tag, cells) in &libs {
+            let lib = library(tag, cells);
+            let mut mapped = 0;
+            for clock_positive in [true, false] {
+                for clear in [None, Some((true, Trit::Zero)), Some((false, Trit::Zero)), Some((true, Trit::One)), Some((false, Trit::One))] {
+                    let mut g = Graph::new();
+                    let ck = g.add(Kind::Input("ck".into(), 1))[0];
+                    let d = g.add(Kind::Input("d".into(), 1));
+                    let c = g.add(Kind::Input("c".into(), 1))[0];
+                    let (clear_cn, clear_value) = match clear {
+                        None => (ControlNet::ZERO, Trit::Undef),
+                        Some((pos, v)) => (ControlNet::with_polarity(c, pos), v),
+                    };
+                    let q = g.add(Kind::Dff(Box::new(Dff {
+                        data: d,
+                        clock: ControlNet::with_polarity(ck, clock_positive),
+                        clear: clear_cn,
+                        reset: ControlNet::ZERO,
+                        enable: ControlNet::ONE,
+                        init_value: vec![Trit::Undef],
+                        reset_value: vec![Trit::Undef],
+                        clear_value: vec![clear_value],
+                    })));
+                    g.add(Kind::Output("q".into(), q));
+                    let before = g.clone();
+                    let mut after = g;
+                    if map_sequentials(&mut after, &lib).is_err() {
+                        continue;
+                    }
+                    mapped += 1;
+                    let shape = format!("{tag}: clock {} clear {clear:?}", if clock_positive { "rising" } else { "falling" });
+                    for a in &steps {
+                        for b in &steps {
+                            for e in &steps {
+                                for f in &steps {
+                                    let (mut r, mut m) = (Eval::new(&before), Eval::new(&after));
+                                    for (k, s) in [a, b, e, f].into_iter().enumerate() {
+                                        for x in [&mut r, &mut m] {
+                                            x.set_input("d", &[s[1]]);
+                                            x.set_input("c", &[s[2]]);
+                                            x.clock("ck", &[s[0]]);
+                                        }
+                                        let (want, got) = (r.output("q")[0], m.output("q")[0]);
+                                        assert!(
+                                            want == Trit::Undef || want == got,
+                                            "{shape}: step {k} of {:?}: register {want:?}, mapped {got:?}",
+                                            [a, b, e, f]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(mapped, 10, "{tag}: every register shape maps (the mapper complements clock and clear)");
+        }
+    }
+}

@@ -3,6 +3,8 @@
 
 pub mod constant;
 pub mod dump;
+#[cfg(test)]
+pub(crate) mod eval;
 pub mod graph;
 pub mod instance;
 pub mod net;

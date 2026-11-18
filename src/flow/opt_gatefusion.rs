@@ -377,6 +377,67 @@ pub fn gate_fusion_opt(g: &mut Graph, libs: &Libraries) {
 mod tests {
     use super::*;
 
+    /// A sum's value: some cube's literals all hold, then complemented when `oc`.
+    fn sop_value(sop: &Sop, x: u32) -> bool {
+        sop.cubes.iter().any(|c| x & c.pos == c.pos && x & c.neg == 0) ^ sop.oc
+    }
+
+    /// Every disjoint sum (the form the cells' functions are kept in) over `n` inputs: each input
+    /// in no cube or in one, either polarity; each output polarity.
+    fn disjoint_sops(n: u32) -> Vec<Sop> {
+        let mut out = Vec::new();
+        let choices = 1 + 2 * n;
+        for code in 0..choices.pow(n) {
+            let mut cubes = vec![Cube::default(); n as usize];
+            let mut c = code;
+            for i in 0..n {
+                let k = c % choices;
+                c /= choices;
+                if k == 0 {
+                    continue;
+                }
+                let (cube, neg) = ((k - 1) / 2, (k - 1) % 2 == 1);
+                if neg {
+                    cubes[cube as usize].neg |= 1 << i;
+                } else {
+                    cubes[cube as usize].pos |= 1 << i;
+                }
+            }
+            let cubes: BTreeSet<Cube> = cubes.into_iter().filter(|c| c.support() != 0).collect();
+            for oc in [false, true] {
+                out.push(Sop { cubes: cubes.clone(), oc });
+            }
+        }
+        out
+    }
+
+    /// The fused sum is the function it stands for: B with its input `k` driven by A (B's inputs
+    /// at bits 0.., A's at 16..), on every input. Every pair of disjoint sums over 3 inputs, every
+    /// link input; a pair the rule does not fuse (None) is not checked.
+    #[test]
+    fn a_composed_sum_is_b_of_a() {
+        let sops = disjoint_sops(3);
+        let mut fused = 0;
+        for a in &sops {
+            for b in &sops {
+                for k in 0..3 {
+                    let Some(r) = compose_sops(a, b, k) else { continue };
+                    fused += 1;
+                    for xb in 0..8u32 {
+                        for xa in 0..8u32 {
+                            let link = sop_value(a, xa);
+                            let xb_linked = (xb & !(1 << k)) | (u32::from(link) << k);
+                            let want = sop_value(b, xb_linked);
+                            let got = sop_value(&r, (xb & !(1 << k)) | xa << 16);
+                            assert_eq!(got, want, "A {a:?} into input {k} of B {b:?}: {r:?} at xb={xb:03b} xa={xa:03b}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fused > 0, "the rule fused some pair");
+    }
+
     // Rule: NAND2 = !(A1 & A2) is disjoint both ways; its complement (one cube A1A2, oc) has fewer
     // cubes than the direct sum (!A1 + !A2), so the direct sum is kept.
     #[test]

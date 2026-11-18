@@ -682,6 +682,126 @@ pub fn map_combinationals(g: &mut Graph, libs: &Libraries) -> Result<(), ElabErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::eval::{all_values, Eval};
+    use crate::ir::Trit;
+
+    /// A small library: inverter, ties, the 2-input gates, AOI/OAI, a 3-input AND and a mux.
+    const GATES: &str = r#"library (gates) {
+  cell (INV) { area : 1; pin (A) { direction : input; } pin (Y) { direction : output; function : "!A"; } }
+  cell (TIEH) { area : 1; pin (H) { direction : output; function : "1"; } }
+  cell (TIEL) { area : 1; pin (L) { direction : output; function : "0"; } }
+  cell (NAND2) { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A & B)"; } }
+  cell (NOR2) { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A | B)"; } }
+  cell (AND2) { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A & B"; } }
+  cell (OR2) { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A | B"; } }
+  cell (XOR2) { area : 4; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A ^ B"; } }
+  cell (XNOR2) { area : 4; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A ^ B)"; } }
+  cell (AOI21) { area : 3; pin (A1) { direction : input; } pin (A2) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!((A1 & A2) | B)"; } }
+  cell (OAI21) { area : 3; pin (A1) { direction : input; } pin (A2) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!((A1 | A2) & B)"; } }
+  cell (AND3) { area : 4; pin (A) { direction : input; } pin (B) { direction : input; } pin (C) { direction : input; } pin (Y) { direction : output; function : "A & B & C"; } }
+  cell (MUX2) { area : 5; pin (A) { direction : input; } pin (B) { direction : input; } pin (S) { direction : input; } pin (Y) { direction : output; function : "(A & !S) | (B & S)"; } }
+}
+"#;
+
+    fn gates() -> Libraries {
+        let path = std::env::temp_dir().join(format!("vyges-syn-cmap-{}.lib", std::process::id()));
+        std::fs::write(&path, GATES).expect("the temporary directory is writable");
+        let mut libs = Libraries::default();
+        libs.read(&path.to_string_lossy()).expect("the library parses");
+        let _ = std::fs::remove_file(&path);
+        libs
+    }
+
+    /// Function `t` of `n` inputs as AND / ANDNOT / OR gates, in one of two shapes: a sum of its
+    /// minterms, or a Shannon tree on the last input (`x ? f1 : f0` as `x & f1 | f0 & !x`).
+    fn build(g: &mut Graph, x: &[Net], t: u64, n: usize, shannon: bool) -> Net {
+        if shannon && n > 0 {
+            let half = 1usize << (n - 1);
+            let mask = (1u64 << half) - 1;
+            let (f0, f1) = (build(g, x, t & mask, n - 1, true), build(g, x, (t >> half) & mask, n - 1, true));
+            let v = x[n - 1];
+            let hi = g.add(Kind::Bin(BinOp::And, vec![v], vec![f1]))[0];
+            let lo = g.add(Kind::Bin(BinOp::Andnot, vec![f0], vec![v]))[0];
+            return g.add(Kind::Bin(BinOp::Or, vec![hi], vec![lo]))[0];
+        }
+        let mut sum = Net::ZERO;
+        for row in 0..1usize << n {
+            if (t >> row) & 1 == 0 {
+                continue;
+            }
+            let mut term = Net::ONE;
+            for (i, &v) in x.iter().enumerate().take(n) {
+                term = if (row >> i) & 1 == 1 {
+                    g.add(Kind::Bin(BinOp::And, vec![term], vec![v]))[0]
+                } else {
+                    g.add(Kind::Bin(BinOp::Andnot, vec![term], vec![v]))[0]
+                };
+            }
+            sum = g.add(Kind::Bin(BinOp::Or, vec![sum], vec![term]))[0];
+        }
+        sum
+    }
+
+    /// The mapped netlist computes the cut's function: every function of 3 inputs, in both
+    /// shapes, mapped onto [`GATES`] and evaluated (`ir::eval`: a cell by its Liberty function)
+    /// on every input, against its truth table; nothing but library cells is left.
+    #[test]
+    fn mapped_cells_compute_the_function() {
+        let libs = gates();
+        for t in 0..1u64 << 8 {
+            for shannon in [false, true] {
+                let mut g = Graph::new();
+                let x: Vec<Net> = (0..3).map(|i| g.add(Kind::Input(format!("x{i}"), 1))[0]).collect();
+                let y = build(&mut g, &x, t, 3, shannon);
+                g.add(Kind::Output("y".into(), vec![y]));
+                map_combinationals(&mut g, &libs).expect("the library has an inverter and ties");
+                let mut it = g.instances();
+                while let Some(id) = it.next(&g) {
+                    let k = &g.inst(id).kind;
+                    let library = matches!(k, Kind::Input(..) | Kind::Output(..) | Kind::Name(_) | Kind::Target(..));
+                    assert!(library || matches!(k, Kind::TieHigh | Kind::TieLow | Kind::TieX), "t={t:#04x}: a {} is left", k.keyword());
+                }
+                let mut e = Eval::new(&g);
+                for v in all_values(3, false) {
+                    for (i, &b) in v.iter().enumerate() {
+                        e.set_input(&format!("x{i}"), &[b]);
+                    }
+                    let row = v.iter().enumerate().fold(0, |r, (i, &b)| r | (usize::from(b == Trit::One) << i));
+                    let want = if (t >> row) & 1 == 1 { Trit::One } else { Trit::Zero };
+                    assert_eq!(e.output("y"), [want], "t={t:#04x} shannon={shannon} row {row}:\n{}", g.dump());
+                }
+            }
+        }
+    }
+
+
+    /// `recode6` by its definition: row `i2` over `vars2` reads `t1` at the row over `vars1` that
+    /// takes each variable's value from `vars2`. Every pair of sorted variable sets `vars1` ⊆
+    /// `vars2` ⊆ {0..5} with `vars1` of at most 3, every function over `vars1`.
+    #[test]
+    fn recode6_moves_a_table_onto_a_superset_of_its_variables() {
+        let ids: Vec<Net> = (0..5).map(|i| Net(10 + 2 * i)).collect();
+        for set2 in 0u32..1 << 5 {
+            let vars2: Vec<Net> = (0..5).filter(|i| set2 >> i & 1 == 1).map(|i| ids[i as usize]).collect();
+            for set1 in 0u32..1 << 5 {
+                if set1 & !set2 != 0 || set1.count_ones() > 3 {
+                    continue;
+                }
+                let vars1: Vec<Net> = (0..5).filter(|i| set1 >> i & 1 == 1).map(|i| ids[i as usize]).collect();
+                for t1 in 0..1u64 << (1 << vars1.len()) {
+                    let got = recode6(t1, &vars1, &vars2);
+                    for i2 in 0..1usize << vars2.len() {
+                        let mut i1 = 0;
+                        for (k, v) in vars1.iter().enumerate() {
+                            let p = vars2.iter().position(|w| w == v).expect("vars1 is a subset");
+                            i1 |= ((i2 >> p) & 1) << k;
+                        }
+                        assert_eq!((got >> i2) & 1, (t1 >> i1) & 1, "t1={t1:#x} vars1={vars1:?} vars2={vars2:?} row {i2}");
+                    }
+                }
+            }
+        }
+    }
 
     // Rule: a cut union merges by net id, a shared leaf once; past the limit it fails.
     #[test]

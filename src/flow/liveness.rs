@@ -273,6 +273,156 @@ pub fn liveness_opt(g: &mut Graph, replace_combinational: bool) -> (usize, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::eval::Eval;
+    use crate::ir::graph::InstId;
+    use crate::ir::Bundle;
+
+    const STATES: [State; 4] = [State::U, State::Zero, State::One, State::A];
+
+    /// The values a net in state `s` can carry: X always, 0 and 1 as the state allows.
+    fn concrete(s: State) -> Vec<Trit> {
+        let mut v = vec![Trit::Undef];
+        if s.can(State::Zero) {
+            v.push(Trit::Zero);
+        }
+        if s.can(State::One) {
+            v.push(Trit::One);
+        }
+        v
+    }
+
+    /// Soundness of one cell's transfer function: for every state of each of its `m` input bits
+    /// and every value those states allow, the cell's value (`ir::eval`) is one its output state
+    /// allows. A cell on `m` one-bit inputs `i0..`, built by `make` from those nets.
+    fn transfer_is_sound(name: &str, m: usize, make: &dyn Fn(&[Net]) -> Kind) {
+        let mut g = Graph::new();
+        let ins: Bundle = (0..m).map(|k| g.add(Kind::Input(format!("i{k}"), 1))[0]).collect();
+        let y = g.add(make(&ins));
+        let id: InstId = g.resolve(y[0]).0;
+        g.add(Kind::Output("y".into(), y.clone()));
+        let mut states = vec![vec![]];
+        for _ in 0..m {
+            states = states.into_iter().flat_map(|v: Vec<State>| STATES.iter().map(move |&s| [v.clone(), vec![s]].concat())).collect();
+        }
+        let mut e = Eval::new(&g);
+        for st in states {
+            let mut la = LivenessAnalysis::new(&g);
+            for (k, &n) in ins.iter().enumerate() {
+                la.values[n.0 as usize] = st[k];
+            }
+            let mut changed = false;
+            la.compute_outputs(&g, id, &mut changed);
+            let out: Vec<State> = y.iter().map(|&n| la.value_of(n)).collect();
+            let mut values = vec![vec![]];
+            for &s in &st {
+                values = values.into_iter().flat_map(|v: Vec<Trit>| concrete(s).into_iter().map(move |t| [v.clone(), vec![t]].concat())).collect();
+            }
+            for v in values {
+                for (k, &t) in v.iter().enumerate() {
+                    e.set_input(&format!("i{k}"), &[t]);
+                }
+                let got = e.output("y");
+                for (bit, (&t, &o)) in got.iter().zip(&out).enumerate() {
+                    let ok = match t {
+                        Trit::Undef => true,
+                        Trit::Zero => o.can(State::Zero),
+                        Trit::One => o.can(State::One),
+                    };
+                    assert!(ok, "{name}: input states {st:?}, values {v:?}: bit {bit} is {t:?}, its state {o:?}");
+                }
+            }
+        }
+    }
+
+    /// A register's state joins its own, its data, its initial value and the clear value when the
+    /// clear can fire: every value it can hold after an edge (`ir::eval`'s step, from any value its
+    /// state allows, clear and enable any value theirs allow) is one the new state allows; and so
+    /// is its initial value.
+    #[test]
+    fn register_transfer_is_sound() {
+        for init in [Trit::Zero, Trit::One, Trit::Undef] {
+            for clear_value in [Trit::Zero, Trit::One, Trit::Undef] {
+                let mut g = Graph::new();
+                let d = g.add(Kind::Input("d".into(), 1));
+                let en = g.add(Kind::Input("en".into(), 1));
+                let clr = g.add(Kind::Input("clr".into(), 1));
+                let q = g.add(Kind::Dff(Box::new(Dff {
+                    data: d.clone(),
+                    clock: crate::ir::ControlNet::pos(Net::UNDEF),
+                    clear: crate::ir::ControlNet::pos(clr[0]),
+                    reset: crate::ir::ControlNet::ZERO,
+                    enable: crate::ir::ControlNet::pos(en[0]),
+                    init_value: vec![init],
+                    reset_value: vec![Trit::Undef],
+                    clear_value: vec![clear_value],
+                })));
+                let id = g.resolve(q[0]).0;
+                g.add(Kind::Output("q".into(), q.clone()));
+                let mut e = Eval::new(&g);
+                for sq in STATES {
+                    for sd in STATES {
+                        for se in STATES {
+                            for sc in STATES {
+                                let mut la = LivenessAnalysis::new(&g);
+                                for (n, s) in [(q[0], sq), (d[0], sd), (en[0], se), (clr[0], sc)] {
+                                    la.values[n.0 as usize] = s;
+                                }
+                                let mut changed = false;
+                                la.compute_outputs(&g, id, &mut changed);
+                                let out = la.value_of(q[0]);
+                                let allows = |t: Trit| match t {
+                                    Trit::Undef => true,
+                                    Trit::Zero => out.can(State::Zero),
+                                    Trit::One => out.can(State::One),
+                                };
+                                assert!(allows(init), "init {init:?} not in {out:?}");
+                                for vq in concrete(sq) {
+                                    for vd in concrete(sd) {
+                                        for ve in concrete(se) {
+                                            for vc in concrete(sc) {
+                                                e.set_register(id, &[vq]);
+                                                e.set_input("d", &[vd]);
+                                                e.set_input("en", &[ve]);
+                                                e.set_input("clr", &[vc]);
+                                                e.step();
+                                                let t = e.output("q")[0];
+                                                assert!(allows(t), "q {vq:?} d {vd:?} en {ve:?} clr {vc:?} -> {t:?}, state {out:?} (states q {sq:?} d {sd:?} en {se:?} clr {sc:?}, init {init:?}, clear value {clear_value:?})");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reference's transfer functions over-approximate the cell: every value the cell can
+    /// take (`ir::eval`) is one its output state allows. Exhaustive over every input state and
+    /// every value the states allow: the bitwise cells, not, buffer, mux on one bit; the right
+    /// shifts on a 3-bit word by a 2-bit amount, strides 1 and 2; and the cells the analysis
+    /// over-approximates as a whole (add, compare, multiply, divide, left shift) at 2 bits.
+    #[test]
+    fn transfer_functions_are_sound() {
+        for op in [BinOp::And, BinOp::Or, BinOp::Andnot, BinOp::Xor] {
+            transfer_is_sound(op.keyword(), 2, &|i| Kind::Bin(op, vec![i[0]], vec![i[1]]));
+        }
+        transfer_is_sound("not", 1, &|i| Kind::Not(vec![i[0]]));
+        transfer_is_sound("buf", 1, &|i| Kind::Buffer(vec![i[0]]));
+        transfer_is_sound("mux", 3, &|i| Kind::Mux(i[0], vec![i[1]], vec![i[2]]));
+        for op in [ShiftOp::UShr, ShiftOp::SShr, ShiftOp::XShr] {
+            for stride in [1, 2] {
+                transfer_is_sound(op.keyword(), 5, &|i| Kind::Shift(op, i[..3].to_vec(), i[3..].to_vec(), stride));
+            }
+        }
+        transfer_is_sound("adc", 5, &|i| Kind::Adc(i[..2].to_vec(), i[2..4].to_vec(), i[4]));
+        transfer_is_sound("shl", 4, &|i| Kind::Shift(ShiftOp::Shl, i[..2].to_vec(), i[2..].to_vec(), 1));
+        for op in [BinOp::Eq, BinOp::ULt, BinOp::SLt, BinOp::Mul, BinOp::UDiv, BinOp::UMod, BinOp::SDivFloor, BinOp::SModTrunc] {
+            transfer_is_sound(op.keyword(), 4, &|i| Kind::Bin(op, i[..2].to_vec(), i[2..].to_vec()));
+        }
+    }
 
     // Rule: the four values are "can be 0" / "can be 1" bit sets with X always possible; AND can be
     // 1 only when both can, 0 when either can; XOR by the four input pairs; a mux takes the

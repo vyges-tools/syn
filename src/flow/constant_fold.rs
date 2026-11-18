@@ -419,6 +419,154 @@ mod tests {
         g.dump()
     }
 
+    use crate::ir::eval::{all_values, Eval};
+
+    /// An operand bit drawn from: the constants 0, 1, X, or bit `i` of input `p` or `q`.
+    #[derive(Clone, Copy)]
+    enum Src {
+        K(Trit),
+        P,
+        Q,
+    }
+    const SRCS: [Src; 5] = [Src::K(Trit::Zero), Src::K(Trit::One), Src::K(Trit::Undef), Src::P, Src::Q];
+
+    fn bits(srcs: &[Src], p: &[Net], q: &[Net]) -> Bundle {
+        srcs.iter()
+            .enumerate()
+            .map(|(i, s)| match s {
+                Src::K(t) => Net::from_trit(*t),
+                Src::P => p[i],
+                Src::Q => q[i],
+            })
+            .collect()
+    }
+
+    /// Every operand choice in `choices` of `n` bits each.
+    fn operands(n: usize, choices: &[Src]) -> Vec<Vec<Src>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..n {
+            out = out.into_iter().flat_map(|v| choices.iter().map(move |&c| [v.clone(), vec![c]].concat())).collect();
+        }
+        out
+    }
+
+    /// Builds a cell on two operand bundles in a graph.
+    type MakeOn<'a> = dyn Fn(&mut Graph, &[Net], &[Net]) -> Bundle + 'a;
+    /// A cell on two operands and a carry-in.
+    type MakeCarry = Box<dyn Fn(Bundle, Bundle, Net) -> Kind>;
+
+    /// `constant_fold` replaces a cell under `Equivalence::Refinement`: wherever the cell's value
+    /// is defined, the replacement must have that value. Checked by evaluating the graph before
+    /// and after the pass (`ir::eval`, the reference `TritModel`'s meaning) on every assignment
+    /// of the inputs, X included. Returns the first counterexample.
+    fn refines(make: &MakeOn<'_>, w: u32) -> Result<(), String> {
+        let mut g = Graph::new();
+        let p = g.add(Kind::Input("p".into(), w));
+        let q = g.add(Kind::Input("q".into(), w));
+        let y = make(&mut g, &p, &q);
+        g.add(Kind::Output("y".into(), y));
+        let before = g.clone();
+        let mut after = g;
+        constant_fold(&mut after);
+        let (mut e0, mut e1) = (Eval::new(&before), Eval::new(&after));
+        for pv in all_values(w as usize, true) {
+            for qv in all_values(w as usize, true) {
+                for e in [&mut e0, &mut e1] {
+                    e.set_input("p", &pv);
+                    e.set_input("q", &qv);
+                }
+                let (y0, y1) = (e0.output("y"), e1.output("y"));
+                let bad = y0.iter().zip(&y1).any(|(&a, &b)| a != Trit::Undef && a != b);
+                if bad {
+                    return Err(format!("p={pv:?} q={qv:?}: before {y0:?}, after {y1:?}\n{}", before.dump()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bitwise and mux folds, one bit, every operand drawn from 0, 1, X, p, q: each fold
+    /// refines the cell (`Equivalence::Refinement`, as the reference replaces it).
+    #[test]
+    fn bitwise_and_mux_folds_refine_the_cell() {
+        for op in [BinOp::And, BinOp::Or, BinOp::Xor, BinOp::Andnot] {
+            for a in SRCS {
+                for b in SRCS {
+                    let make = |g: &mut Graph, p: &[Net], q: &[Net]| {
+                        let (x, y) = (bits(&[a], p, q), bits(&[b], p, q));
+                        g.add(Kind::Bin(op, x, y))
+                    };
+                    refines(&make, 1).unwrap_or_else(|e| panic!("{}: {e}", op.keyword()));
+                }
+            }
+        }
+        for s in SRCS {
+            for a in SRCS {
+                for b in SRCS {
+                    let make = |g: &mut Graph, p: &[Net], q: &[Net]| {
+                        let sel = bits(&[s], p, q)[0];
+                        let (x, y) = (bits(&[a], p, q), bits(&[b], p, q));
+                        g.add(Kind::Mux(sel, x, y))
+                    };
+                    refines(&make, 1).unwrap_or_else(|e| panic!("mux: {e}"));
+                }
+            }
+        }
+        let make = |g: &mut Graph, p: &[Net], _: &[Net]| {
+            let x = bits(&[Src::P], p, p);
+            g.add(Kind::Not(x))
+        };
+        refines(&make, 1).unwrap_or_else(|e| panic!("not: {e}"));
+    }
+
+    /// The word cells' folds (all constant operands; a constant amount, multiplier or divisor),
+    /// each operand bit drawn from 0, 1, X and an input bit: every 2-bit mix, and at 3 bits an
+    /// input word against every constant and every constant pair.
+    #[test]
+    fn word_folds_refine_the_cell() {
+        let cells: Vec<(&str, MakeCarry)> = vec![
+            ("adc", Box::new(Kind::Adc)),
+            ("eq", Box::new(|a, b, _| Kind::Bin(BinOp::Eq, a, b))),
+            ("ult", Box::new(|a, b, _| Kind::Bin(BinOp::ULt, a, b))),
+            ("slt", Box::new(|a, b, _| Kind::Bin(BinOp::SLt, a, b))),
+            ("mul", Box::new(|a, b, _| Kind::Bin(BinOp::Mul, a, b))),
+            ("udiv", Box::new(|a, b, _| Kind::Bin(BinOp::UDiv, a, b))),
+            ("umod", Box::new(|a, b, _| Kind::Bin(BinOp::UMod, a, b))),
+            ("shl", Box::new(|a, b, _| Kind::Shift(ShiftOp::Shl, a, b, 1))),
+            ("ushr", Box::new(|a, b, _| Kind::Shift(ShiftOp::UShr, a, b, 1))),
+            ("sshr", Box::new(|a, b, _| Kind::Shift(ShiftOp::SShr, a, b, 1))),
+            ("xshr", Box::new(|a, b, _| Kind::Shift(ShiftOp::XShr, a, b, 1))),
+            ("shl2", Box::new(|a, b, _| Kind::Shift(ShiftOp::Shl, a, b, 2))),
+        ];
+        let k3 = [Src::K(Trit::Zero), Src::K(Trit::One), Src::K(Trit::Undef)];
+        let with_p: Vec<Src> = [k3.as_slice(), &[Src::P]].concat();
+        let with_q: Vec<Src> = [k3.as_slice(), &[Src::Q]].concat();
+        for (name, cell) in &cells {
+            let mut cases: Vec<(u32, Vec<Src>, Vec<Src>, Src)> = Vec::new();
+            for a in operands(2, &with_p) {
+                for b in operands(2, &with_q) {
+                    for c in [k3[0], k3[2], Src::P] {
+                        cases.push((2, a.clone(), b.clone(), c));
+                    }
+                }
+            }
+            for b in operands(3, &k3) {
+                cases.push((3, vec![Src::P; 3], b.clone(), k3[0]));
+                for a in operands(3, &k3) {
+                    cases.push((3, a, b.clone(), k3[1]));
+                }
+            }
+            for (w, a, b, c) in cases {
+                let make = |_: &mut Graph, p: &[Net], q: &[Net]| (bits(&a, p, q), bits(&b, p, q), bits(&[c], p, q)[0]);
+                let make = |g: &mut Graph, p: &[Net], q: &[Net]| {
+                    let (x, y, ci) = make(g, p, q);
+                    g.add(cell(x, y, ci))
+                };
+                refines(&make, w).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
     #[test]
     fn and_of_a_net_with_itself_is_the_net() {
         assert_eq!(folded("%3:2 = input \"a\"\n%5:2 = and %3:2 %3:2\n%7:0 = output \"y\" %5:2\n"),
