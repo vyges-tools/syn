@@ -311,10 +311,19 @@ impl Bitblasted<'_> {
             // a 32-bit amount, its shift count taken mod 32 as the machine does
             let shift = 1u32.wrapping_shl(k as u32).wrapping_mul(stride) as usize;
             if shift >= n {
+                // DIVERGENCE (vyges-syn D3): this bit and every higher one each shift past the
+                // width, so the result is the fill when any of them is set (Verilog; the
+                // reference's `Const` agrees). The reference reads only this bit and stops, so a
+                // higher amount bit was ignored. With this bit the last, the gates are the same.
+                let mut any = bk;
+                for &bh in &b[k + 1..] {
+                    let h = self.import(bh);
+                    any = self.OR(any, h);
+                }
                 for c in cur.iter_mut() {
                     *c = match sign {
-                        Some(s) => self.MUX(bk, s, *c),
-                        None => self.AND(*c, not(bk)),
+                        Some(s) => self.MUX(any, s, *c),
+                        None => self.AND(*c, not(any)),
                     };
                 }
                 break;
@@ -666,6 +675,103 @@ pub fn bitblast(g: &mut Graph, blast_arith: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::eval::{all_values, Eval};
+    use crate::ir::Trit;
+
+    /// A cell on two operands, named.
+    type MakeCell = Box<dyn Fn(Bundle, Bundle) -> Kind>;
+
+    /// Rule (Verilog, IEEE 1800 11.4.10; and the reference's own constant folder `Const`): a
+    /// shift by an amount at or past the width gives all zeros, or all copies of the sign bit for
+    /// an arithmetic right shift, whichever amount bit carries it. DIVERGENCE (vyges-syn D3): the
+    /// reference's barrel shifter stops at the first amount bit whose weight reaches the width,
+    /// so `a << 8` with a 4-bit `a` and a 4-bit amount gave `a`. Every amount bit is read here.
+    #[test]
+    fn a_shift_past_the_width_reads_every_amount_bit() {
+        for (op, a, want) in [(ShiftOp::Shl, 0b1011, 0), (ShiftOp::UShr, 0b1011, 0), (ShiftOp::SShr, 0b1011, 0b1111), (ShiftOp::SShr, 0b0111, 0)] {
+            for amount in [4u64, 8, 12, 15] {
+                let mut g = Graph::new();
+                let x = g.add(Kind::Input("a".into(), 4));
+                let b = g.add(Kind::Input("b".into(), 4));
+                let y = g.add(Kind::Shift(op, x, b, 1));
+                g.add(Kind::Output("y".into(), y));
+                bitblast(&mut g, true);
+                let mut e = Eval::new(&g);
+                e.set_input_u64("a", 4, a);
+                e.set_input_u64("b", 4, amount);
+                let bits: Vec<Trit> = (0..4).map(|i| if want >> i & 1 == 1 { Trit::One } else { Trit::Zero }).collect();
+                assert_eq!(e.output("y"), bits, "{} {a:04b} by {amount}", op.keyword());
+            }
+        }
+    }
+
+    /// One cell on inputs `a` (width `wa`) and `b` (width `wb`), and its bit-blast: equal to the
+    /// cell (`ir::eval`) wherever the cell is defined, on every defined input
+    /// (`Equivalence::TwoValued`, as the pass replaces it); and the blast is gates only. Returns
+    /// the cell's keyword and the first counterexample.
+    fn blasts_to_the_cell(make: &dyn Fn(Bundle, Bundle) -> Kind, wa: u32, wb: u32) -> Result<(), String> {
+        let mut g = Graph::new();
+        let a = g.add(Kind::Input("a".into(), wa));
+        let b = g.add(Kind::Input("b".into(), wb));
+        let y = g.add(make(a, b));
+        g.add(Kind::Output("y".into(), y));
+        let before = g.clone();
+        let mut after = g;
+        bitblast(&mut after, true);
+        // the replaced cells stay in the graph, unread, until the next normalize
+        after.normalize();
+        let mut it = after.instances();
+        while let Some(id) = it.next(&after) {
+            let k = &after.inst(id).kind;
+            let gate = matches!(k, Kind::TieHigh | Kind::TieLow | Kind::TieX | Kind::Input(..) | Kind::Output(..) | Kind::Name(_))
+                || matches!(k, Kind::Buffer(_) | Kind::Not(_) | Kind::Mux(..))
+                || matches!(k, Kind::Bin(op, ..) if op.is_bitwise());
+            if !gate && !is_divmod(k) {
+                return Err(format!("a {} is left after the pass", k.keyword()));
+            }
+        }
+        let (mut e0, mut e1) = (Eval::new(&before), Eval::new(&after));
+        for av in all_values(wa as usize, false) {
+            for bv in all_values(wb as usize, false) {
+                for e in [&mut e0, &mut e1] {
+                    e.set_input("a", &av);
+                    e.set_input("b", &bv);
+                }
+                let (y0, y1) = (e0.output("y"), e1.output("y"));
+                if y0.iter().zip(&y1).any(|(&p, &q)| p != Trit::Undef && p != q) {
+                    return Err(format!("a={av:?} b={bv:?}: cell {y0:?}, gates {y1:?}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every cell the pass blasts, every width up to 4 (shift amounts up to 3 bits, strides 1 to
+    /// 3), every defined input: the gates compute the cell (`TritModel`'s meaning, `ir::eval`).
+    #[test]
+    fn every_cell_bitblasts_to_its_meaning() {
+        let mut cells: Vec<(String, MakeCell, bool)> = Vec::new();
+        for op in [BinOp::And, BinOp::Or, BinOp::Andnot, BinOp::Xor, BinOp::Eq, BinOp::ULt, BinOp::SLt, BinOp::Mul] {
+            cells.push((op.keyword().into(), Box::new(move |a, b| Kind::Bin(op, a, b)), true));
+        }
+        cells.push(("not".into(), Box::new(|a, _| Kind::Not(a)), true));
+        cells.push(("adc".into(), Box::new(|a, b| Kind::Adc(a, b, Net::ONE)), true));
+        cells.push(("adc0".into(), Box::new(|a, b| Kind::Adc(a, b, Net::ZERO)), true));
+        cells.push(("mux".into(), Box::new(|a, b| Kind::Mux(a[0], b.clone(), b.iter().rev().copied().collect())), true));
+        for op in [ShiftOp::Shl, ShiftOp::UShr, ShiftOp::SShr, ShiftOp::XShr] {
+            for stride in 1..=3 {
+                cells.push((format!("{} #{stride}", op.keyword()), Box::new(move |a, b| Kind::Shift(op, a, b, stride)), false));
+            }
+        }
+        for (name, make, same_width) in &cells {
+            for wa in 1..=4 {
+                let wbs: Vec<u32> = if *same_width { vec![wa] } else { (1..=3).collect() };
+                for wb in wbs {
+                    blasts_to_the_cell(make.as_ref(), wa, wb).unwrap_or_else(|e| panic!("{name} at {wa}/{wb}: {e}"));
+                }
+            }
+        }
+    }
 
     /// The value of `net` under the inputs `env` (name -> bits), through the gates the pass builds.
     fn eval(g: &Graph, net: Net, env: &BTreeMap<String, u64>) -> bool {
