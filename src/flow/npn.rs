@@ -141,6 +141,9 @@ fn apply(m: Truth6, ninputs: usize, order: &[usize; 6], compl: impl Fn(usize) ->
 pub fn npn_semiclass(mut m: Truth6, ninputs: usize, npn: &mut Npn) -> Truth6 {
     *npn = Npn::default();
     if ninputs == 0 {
+        // Divergence D5: the reference returns here with no output complement, so the constant 1
+        // gets the representative of the constant 0 and a tie cell of the wrong value.
+        npn.output_complement = m & 1 == 1;
         return 0;
     }
     let nbits = 1 << ninputs;
@@ -189,6 +192,9 @@ fn next_permutation(v: &mut [usize]) -> bool {
 pub fn npn_semiclass_all_repr(mut m: Truth6, ninputs: usize, mut cb: impl FnMut(Truth6, &Npn)) {
     let mut npn = Npn::default();
     if ninputs == 0 {
+        // Divergence D5, as in `npn_semiclass`: the constant 1 reaches the representative 0
+        // through the output complement, so the high tie is indexed apart from the low one.
+        npn.output_complement = m & 1 == 1;
         cb(0, &npn);
         return;
     }
@@ -351,6 +357,23 @@ mod tests {
         let mut n = 0;
         npn_semiclass_all_repr(0b0110, 2, |_, _| n += 1);
         assert_eq!(n, 16);
+    }
+
+    // Divergence D5. Rule (the transform must map the function onto its representative, as at
+    // every other width): of no inputs, the constant 0 is its own representative and the
+    // constant 1 reaches it by the output complement, in both helpers. The reference
+    // (`combinational_mapper_npn.cc`, both `!ninputs` returns at the pin) leaves the complement
+    // off, so a cut whose function is the constant 1 is matched to the class of the 0.
+    #[test]
+    fn a_constant_reaches_its_representative_through_the_output_complement() {
+        for m in [0u64, 1] {
+            let mut npn = Npn::default();
+            let sc = npn_semiclass(m, 0, &mut npn);
+            assert_eq!((sc, npn.output_complement), (0, m == 1), "npn_semiclass of the constant {m}");
+            let mut seen = Vec::new();
+            npn_semiclass_all_repr(m, 0, |r, t| seen.push((r, t.output_complement)));
+            assert_eq!(seen, [(0, m == 1)], "npn_semiclass_all_repr of the constant {m}");
+        }
     }
 
     // Rule: composing a transform with its inverse is the identity.

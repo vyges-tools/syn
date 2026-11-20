@@ -704,7 +704,11 @@ mod tests {
 "#;
 
     fn gates() -> Libraries {
-        let path = std::env::temp_dir().join(format!("vyges-syn-cmap-{}.lib", std::process::id()));
+        // One file per call: tests run in parallel threads of one process, and each removes its
+        // file after reading it.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vyges-syn-cmap-{}-{call}.lib", std::process::id()));
         std::fs::write(&path, GATES).expect("the temporary directory is writable");
         let mut libs = Libraries::default();
         libs.read(&path.to_string_lossy()).expect("the library parses");
@@ -774,6 +778,30 @@ mod tests {
         }
     }
 
+    /// Divergence D5. A node whose function over its cut is a constant, though no gate is: `y =
+    /// (a & b) & (a & !b)`. Cut enumeration drops both variables (neither is in the support), the
+    /// cut has no inputs, and the node is matched to the tie cell of its value. In the reference
+    /// both constants share the class of no inputs with no output complement, the prune keeps one
+    /// tie (`TIEH`, by name at equal area), and this node, 0, becomes 1. Found on a CoralNPU
+    /// block, where ABC's output held such a node.
+    #[test]
+    fn a_node_constant_over_its_cut_maps_to_the_tie_of_its_value() {
+        let libs = gates();
+        let mut g = Graph::new();
+        let a = g.add(Kind::Input("a".into(), 1))[0];
+        let b = g.add(Kind::Input("b".into(), 1))[0];
+        let ab = g.add(Kind::Bin(BinOp::And, vec![a], vec![b]))[0];
+        let a_nb = g.add(Kind::Bin(BinOp::Andnot, vec![a], vec![b]))[0];
+        let y = g.add(Kind::Bin(BinOp::And, vec![ab], vec![a_nb]))[0];
+        g.add(Kind::Output("y".into(), vec![y]));
+        map_combinationals(&mut g, &libs).expect("the library has an inverter and ties");
+        let mut e = Eval::new(&g);
+        for v in all_values(2, false) {
+            e.set_input("a", &[v[0]]);
+            e.set_input("b", &[v[1]]);
+            assert_eq!(e.output("y"), [Trit::Zero], "a={:?} b={:?}:\n{}", v[0], v[1], g.dump());
+        }
+    }
 
     /// `recode6` by its definition: row `i2` over `vars2` reads `t1` at the row over `vars1` that
     /// takes each variable's value from `vars2`. Every pair of sorted variable sets `vars1` ⊆
