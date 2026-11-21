@@ -201,11 +201,6 @@ fn fold_one(g: &Graph, id: InstId, out: &[Net]) -> Option<Bundle> {
                 .collect();
             changed.then_some(r)
         }
-        Kind::Adc(a, b, cin) => {
-            let (ac, bc) = (lookup_const(g, a)?, lookup_const(g, b)?);
-            let cin = strip_buffers(g, *cin);
-            cin.is_const().then(|| fit(k::adc(&ac, &bc, cin.const_trit())))
-        }
         Kind::Bin(op @ (BinOp::Eq | BinOp::ULt | BinOp::SLt), a, b) => {
             let (ac, bc) = (lookup_const(g, a)?, lookup_const(g, b)?);
             let t = match op {
@@ -259,11 +254,61 @@ fn fold_one(g: &Graph, id: InstId, out: &[Net]) -> Option<Bundle> {
     }
 }
 
+/// An adder's carry chain cut where it can be (OpenROAD #12080, after prjunnamed's rule). Walking
+/// the stages from the bottom with the carry into the next unemitted stage (at first the carry
+/// in, through its buffers):
+///
+/// - equal summands at stage `i` (through their buffers) cut the chain: the pending stages below
+///   become a new adder on the ORIGINAL summand bits with that carry in (none pending: the carry
+///   itself), whose carry out is stage `i`'s sum bit; the carry out of stage `i` is the summand;
+/// - else, with no stage pending, a summand equal to the carry makes the sum bit the other
+///   summand, the carry unchanged.
+///
+/// Once anything is emitted, the pending stages and the carry out become one more adder (the
+/// carry when none are pending). Nothing emitted: no fold — an all-constant adder folds through
+/// these rules, the old whole-adder constant evaluation is gone. The new adders are added during
+/// the walk and wait for the next round.
+fn fold_adc(g: &mut Graph, a: &[Net], b: &[Net], cin: Net) -> Option<Bundle> {
+    let width = a.len() + 1;
+    let mut out = Vec::with_capacity(width);
+    let mut carry = strip_buffers(g, cin);
+    let batch = |g: &mut Graph, out: &mut Vec<Net>, upto: usize, carry: Net| {
+        let from = out.len();
+        let value = if upto > from { g.add(Kind::Adc(a[from..upto].to_vec(), b[from..upto].to_vec(), carry)) } else { vec![carry] };
+        out.extend(value);
+    };
+    for i in 0..width - 1 {
+        let (ai, bi) = (strip_buffers(g, a[i]), strip_buffers(g, b[i]));
+        if ai == bi {
+            batch(g, &mut out, i, carry);
+            carry = ai;
+        } else if out.len() == i {
+            if ai == carry {
+                out.push(bi);
+            } else if bi == carry {
+                out.push(ai);
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    batch(g, &mut out, width - 1, carry);
+    Some(out)
+}
+
 fn fold_combinationals(g: &mut Graph) {
     let mut it = g.instances();
     while let Some(id) = it.next(g) {
         let out = g.output(id);
-        if let Some(r) = fold_one(g, id, &out) {
+        let folded = match &g.inst(id).kind {
+            Kind::Adc(a, b, cin) => {
+                let (a, b, cin) = (a.clone(), b.clone(), *cin);
+                fold_adc(g, &a, &b, cin)
+            }
+            _ => fold_one(g, id, &out),
+        };
+        if let Some(r) = folded {
             let support = support_through(g, id, strip_buffers);
             g.replace(&out, &r, Equivalence::Refinement, &support);
         }
@@ -592,5 +637,86 @@ mod tests {
         // The divisor 0b0X10 has one 1 bit (x bits are not counted): a right shift by 1.
         assert_eq!(folded("%3:4 = input \"a\"\n%7:4 = udiv %3:4 0X10\n%11:0 = output \"y\" %7:4\n"),
                    "%3:4 = input \"a\"\n%7:0 = output \"y\" [ 0 %3+1:3 ]\n");
+    }
+
+    /// The adders left in `g`, by summand width.
+    fn adc_widths(g: &Graph) -> Vec<usize> {
+        let mut w: Vec<usize> = g.instance_list().into_iter().filter_map(|id| match &g.inst(id).kind {
+            Kind::Adc(a, _, _) => Some(a.len()),
+            _ => None,
+        }).collect();
+        w.sort();
+        w
+    }
+
+    /// `a` + `b` + carry on two `w`-bit inputs `a`, `b` and a one-bit input `cin`, `wire` editing
+    /// the operands first; folded, checked EQUAL to the unfolded graph on every defined input
+    /// (the upstream tests' `equivalenceCheck(inputsDefined, no refinement)`), and returned.
+    fn adder_folded(w: u32, wire: impl Fn(&mut Bundle, &mut Bundle, &mut Net)) -> Graph {
+        let mut g = Graph::new();
+        let mut a = g.add(Kind::Input("a".into(), w));
+        let mut b = g.add(Kind::Input("b".into(), w));
+        let mut c = g.add(Kind::Input("cin".into(), 1))[0];
+        wire(&mut a, &mut b, &mut c);
+        let y = g.add(Kind::Adc(a, b, c));
+        g.add(Kind::Output("y".into(), y));
+        let before = g.clone();
+        constant_fold(&mut g);
+        g.normalize();
+        let (mut e0, mut e1) = (Eval::new(&before), Eval::new(&g));
+        for av in all_values(w as usize, false) {
+            for bv in all_values(w as usize, false) {
+                for cv in all_values(1, false) {
+                    for e in [&mut e0, &mut e1] {
+                        e.set_input("a", &av);
+                        e.set_input("b", &bv);
+                        e.set_input("cin", &cv);
+                    }
+                    assert_eq!(e0.output("y"), e1.output("y"), "a={av:?} b={bv:?} cin={cv:?}\n{}", g.dump());
+                }
+            }
+        }
+        g
+    }
+
+    // Rule (OpenROAD #12080, upstream test AdcEqualSummandsBreaksCarryChain): equal summands at a
+    // middle stage cut the chain there — the stage's sum is the carry into it, its carry out the
+    // summand — so one adder becomes one below and one above the cut.
+    #[test]
+    fn equal_summands_cut_the_carry_chain() {
+        let g = adder_folded(6, |a, b, _| b[2] = a[2]);
+        assert_eq!(adc_widths(&g), [2, 3]);
+        // at the bottom stage: nothing pending below, the carry in is the low sum bit
+        assert_eq!(adc_widths(&adder_folded(4, |a, b, _| b[0] = a[0])), [3]);
+        // at the top stage: the upper adder is empty, the carry out is the summand
+        assert_eq!(adc_widths(&adder_folded(4, |a, b, _| b[3] = a[3])), [3]);
+    }
+
+    // Rule (#12080, upstream test AdcCarryInEqualsSummand): a summand equal to the carry into a
+    // stage with nothing pending makes the sum the other summand, the carry passing through.
+    #[test]
+    fn a_summand_equal_to_the_carry_drops_its_stage() {
+        let g = adder_folded(5, |a, _, c| *c = a[0]);
+        assert_eq!(adc_widths(&g), [4]);
+        // the other summand too, and stage after stage while the carry is unchanged
+        assert_eq!(adc_widths(&adder_folded(5, |_, b, c| *c = b[0])), [4]);
+        assert_eq!(adc_widths(&adder_folded(5, |a, b, c| { *c = a[0]; b[1] = a[0]; })), [3]);
+        // with a stage pending, no: the carry into the later stage is not the carry held
+        assert_eq!(adc_widths(&adder_folded(3, |a, _, c| *c = a[1])), [3]);
+    }
+
+    // Rule (#12080): the whole-adder constant evaluation is gone; constants fold only through the
+    // stage rules. An all-constant adder with a defined carry folds away; one whose carry is X and
+    // whose low summands differ stays.
+    #[test]
+    fn a_constant_adder_folds_through_the_stage_rules_only() {
+        let one = adder_folded(2, |a, b, c| { *a = vec![Net::ONE, Net::ZERO]; *b = vec![Net::ZERO, Net::ONE]; *c = Net::ZERO; });
+        assert_eq!(adc_widths(&one), Vec::<usize>::new());
+        let mut g = Graph::new();
+        let y = g.add(Kind::Adc(vec![Net::ONE], vec![Net::ZERO], Net::UNDEF));
+        g.add(Kind::Output("y".into(), y));
+        constant_fold(&mut g);
+        g.normalize();
+        assert_eq!(adc_widths(&g), [1]);
     }
 }
