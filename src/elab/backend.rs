@@ -555,8 +555,14 @@ impl Backend {
         Ok(())
     }
 
+    /// A module instance the frontend did not dissolve: refused (code 97), as the reference does.
+    /// Library cells do not come here; they arrive as blackboxes.
+    pub fn add_instance(&mut self) -> Result<(), ElabError> {
+        err(97, "Hierarchical (non-dissolved) module instantiation not supported")
+    }
+
     /// An opaque cell; its output ports' placeholders are wired to its outputs in port order.
-    pub fn add_instance(&mut self, cell_type: &str, ports: Vec<PortConnection>) -> Result<(), ElabError> {
+    pub fn instantiate_blackbox(&mut self, cell_type: &str, ports: Vec<PortConnection>) -> Result<(), ElabError> {
         let cell_ports = ports
             .iter()
             .map(|pc| {
@@ -627,6 +633,46 @@ impl Backend {
             return err(91, "Flops with non-constant asynchronous load unsupported");
         }
         self.dff(d, clock, clear, ControlNet::ONE, to_const(ad), q)
+    }
+
+    /// As `add_aldff`, with an enable: one flop, clear to the constant load, enable on its own pin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_aldffe(
+        &mut self,
+        clk: &[Net],
+        en: &[Net],
+        aload: &[Net],
+        d: &[Net],
+        q: &[Net],
+        ad: &[Net],
+        clk_polarity: bool,
+        en_polarity: bool,
+        aload_polarity: bool,
+    ) -> Result<(), ElabError> {
+        let clock = ControlNet::with_polarity(as_net(clk), clk_polarity);
+        let clear = ControlNet::with_polarity(as_net(aload), aload_polarity);
+        let enable = ControlNet::with_polarity(as_net(en), en_polarity);
+        if !is_const(ad) {
+            return err(91, "Flops with non-constant asynchronous load unsupported");
+        }
+        self.dff(d, clock, clear, enable, to_const(ad), q)
+    }
+
+    /// Memories are not supported: each memory request is refused with the reference's code.
+    pub fn add_memory(&mut self) -> Result<(), ElabError> {
+        err(92, "Memories are unsupported")
+    }
+
+    pub fn add_read_port(&mut self) -> Result<(), ElabError> {
+        err(93, "Memories are unsupported")
+    }
+
+    pub fn add_write_port(&mut self) -> Result<(), ElabError> {
+        err(94, "Memories are unsupported")
+    }
+
+    pub fn add_memory_init(&mut self) -> Result<(), ElabError> {
+        err(95, "Memories are unsupported")
     }
 
     pub fn add_dual_edge_aldff(&mut self) -> Result<(), ElabError> {
@@ -713,5 +759,40 @@ mod tests {
         // Runs: bits 0-1 on s[0] (%9), bit 2 on s[1]; the cell takes (select, on-1, on-0).
         assert!(muxes[0].ends_with(":2 = mux %9 %6:2 %3:2"), "{muxes:?}");
         assert!(muxes[1].ends_with(":1 = mux %9+1 %6+2:1 %3+2:1"), "{muxes:?}");
+    }
+
+    // Rule (reference `syn/src/elab/backend_builder.cc` at OpenROAD f11b4276, sv-elab 2026-11-09):
+    // `add_aldffe` is ONE flop: clock, a clear driven by the async load whose value is the constant
+    // load data, and the enable on its own pin (not a feedback mux); a non-constant load is refused
+    // with 91, as for `add_aldff`.
+    #[test]
+    fn aldffe_is_one_flop_with_clear_and_enable() {
+        let mut b = Backend::new();
+        let sig = b.add_placeholder_signal(4, "", false).unwrap();
+        let (clk, en, al, d) = (vec![sig[0]], vec![sig[1]], vec![sig[2]], vec![sig[3]]);
+        let q = b.add_placeholder_signal(1, "", false).unwrap();
+        b.add_aldffe(&clk, &en, &al, &d, &q, &konst(1, 1), true, false, true).unwrap();
+        let dump = b.graph.dump();
+        let flops: Vec<&str> = dump.lines().filter(|l| l.contains("dff")).collect();
+        assert_eq!(flops.len(), 1, "{dump}");
+        assert_eq!(ops(&b, "mux"), 0, "{dump}");
+        let mut b = Backend::new();
+        let sig = b.add_placeholder_signal(5, "", false).unwrap();
+        let q = b.add_placeholder_signal(1, "", false).unwrap();
+        let e = b.add_aldffe(&[sig[0]], &[sig[1]], &[sig[2]], &[sig[3]], &q, &[sig[4]], true, true, true).unwrap_err();
+        assert_eq!(e.code, 91);
+    }
+
+    // Rule (same source): every memory request is refused, each with its own code: add_memory 92,
+    // add_read_port 93, add_write_port 94, add_memory_init 95; a module instance the frontend did not
+    // dissolve is refused with 97 (library cells arrive through `instantiate_blackbox` instead).
+    #[test]
+    fn memories_and_hierarchical_instances_are_refused_with_the_reference_codes() {
+        let mut b = Backend::new();
+        assert_eq!(b.add_memory().unwrap_err().code, 92);
+        assert_eq!(b.add_read_port().unwrap_err().code, 93);
+        assert_eq!(b.add_write_port().unwrap_err().code, 94);
+        assert_eq!(b.add_memory_init().unwrap_err().code, 95);
+        assert_eq!(b.add_instance().unwrap_err().code, 97);
     }
 }

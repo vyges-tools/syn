@@ -107,11 +107,17 @@ impl Frontend {
             Call::Mux { a, b: bb, s } => b.mux(nets(a), nets(bb), Net(s)),
             Call::Placeholder { width, name, public_name } => b.add_placeholder_signal(width, name, public_name),
             Call::Connect { target, source } => none(b.connect(&nets(target), &nets(source))),
-            // Initial values and memory contents are not carried into the graph.
-            Call::SetInit { .. } | Call::MemoryInit { .. } | Call::NewGraph { .. } => Ok(Bundle::new()),
+            // Initial values are not carried into the graph.
+            Call::SetInit { .. } | Call::NewGraph { .. } => Ok(Bundle::new()),
+            // The reference refuses every memory request, each with its own code (92-95).
+            Call::Memory { .. } => none(b.add_memory()),
+            Call::ReadPort { .. } => none(b.add_read_port()),
+            Call::WritePort { .. } => none(b.add_write_port()),
+            Call::MemoryInit { .. } => none(b.add_memory_init()),
             Call::Input { name, signal } => none(b.add_input(name, nets(signal))),
             Call::Output { name, signal } => none(b.add_output(name, nets(signal))),
-            Call::Instance { cell_type, ports } => {
+            Call::Instance { .. } => none(b.add_instance()),
+            Call::Blackbox { cell_type, ports, .. } => {
                 let ports = ports
                     .into_iter()
                     .map(|p| PortConnection {
@@ -124,13 +130,24 @@ impl Frontend {
                         value: nets(p.value),
                     })
                     .collect();
-                none(b.add_instance(cell_type, ports))
+                none(b.instantiate_blackbox(cell_type, ports))
             }
             Call::DualEdgeAldff { .. } => none(b.add_dual_edge_aldff()),
             Call::Dff { clk, d, q, clk_polarity, .. } => none(b.add_dff(&nets(clk), &nets(d), &nets(q), clk_polarity)),
             Call::Dffe { clk, en, d, q, clk_polarity, en_polarity, .. } => {
                 none(b.add_dffe(&nets(clk), &nets(en), &nets(d), &nets(q), clk_polarity, en_polarity))
             }
+            Call::Aldffe { clk, en, aload, d, q, ad, clk_polarity, en_polarity, aload_polarity, .. } => none(b.add_aldffe(
+                &nets(clk),
+                &nets(en),
+                &nets(aload),
+                &nets(d),
+                &nets(q),
+                &nets(ad),
+                clk_polarity,
+                en_polarity,
+                aload_polarity,
+            )),
             Call::Aldff { clk, aload, d, q, ad, clk_polarity, aload_polarity, .. } => none(b.add_aldff(
                 &nets(clk),
                 &nets(aload),
