@@ -35,9 +35,8 @@ jobs:
         working-directory: .
         run: |
           set -eu
+          ref=main
           for r in slang-lib loom abc-lib opendb opendb-lib sta rsz grt est stt dpl; do
-            # repin branch where the sibling has one; back to main at the merge
-            case $r in abc-lib|stt) ref=main ;; *) ref=repin-f11b4276 ;; esac
             git clone -q --depth 1 --branch "$ref" "https://github.com/vyges-tools/$r" "vyges-tools-$r"
             echo "vyges-tools-$r @ $ref $(git -C vyges-tools-$r rev-parse --short HEAD)"
           done
